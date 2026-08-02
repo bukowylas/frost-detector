@@ -1,0 +1,204 @@
+{
+  "n_nights": 6007,
+  "n_stations": 8,
+  "leave_one_year_out": {
+    "mae_mean": 1.805,
+    "mae_min": 1.666,
+    "mae_max": 1.973,
+    "rmse_mean": 2.264,
+    "mae_climatology_mean": 2.947,
+    "mae_fao_mean": 1.869,
+    "recommended_alarm_c": 1.5,
+    "frost_recall_mean": 0.754,
+    "frost_precision_mean": 0.643,
+    "alarm_threshold_sweep": {
+      "0.0": {
+        "recall": 0.529,
+        "precision": 0.808
+      },
+      "0.5": {
+        "recall": 0.612,
+        "precision": 0.759
+      },
+      "1.0": {
+        "recall": 0.69,
+        "precision": 0.705
+      },
+      "1.5": {
+        "recall": 0.754,
+        "precision": 0.643
+      },
+      "2.0": {
+        "recall": 0.803,
+        "precision": 0.591
+      }
+    },
+    "per_fold": [
+      {
+        "fold": "2019",
+        "n_test": 1208,
+        "mae_model": 1.909,
+        "rmse_model": 2.365,
+        "mae_climatology": 3.098,
+        "mae_fao": 1.995,
+        "frost_recall": 0.762,
+        "frost_precision": 0.495
+      },
+      {
+        "fold": "2020",
+        "n_test": 1183,
+        "mae_model": 1.733,
+        "rmse_model": 2.16,
+        "mae_climatology": 2.796,
+        "mae_fao": 1.861,
+        "frost_recall": 0.754,
+        "frost_precision": 0.618
+      },
+      {
+        "fold": "2021",
+        "n_test": 1217,
+        "mae_model": 1.666,
+        "rmse_model": 2.12,
+        "mae_climatology": 2.854,
+        "mae_fao": 1.749,
+        "frost_recall": 0.79,
+        "frost_precision": 0.643
+      },
+      {
+        "fold": "2022",
+        "n_test": 1187,
+        "mae_model": 1.973,
+        "rmse_model": 2.48,
+        "mae_climatology": 2.916,
+        "mae_fao": 1.954,
+        "frost_recall": 0.705,
+        "frost_precision": 0.751
+      },
+      {
+        "fold": "2023",
+        "n_test": 1212,
+        "mae_model": 1.744,
+        "rmse_model": 2.196,
+        "mae_climatology": 3.069,
+        "mae_fao": 1.784,
+        "frost_recall": 0.759,
+        "frost_precision": 0.709
+      }
+    ]
+  },
+  "leave_one_station_out": {
+    "mae_mean": 1.638,
+    "mae_min": 1.21,
+    "mae_max": 1.882,
+    "rmse_mean": 2.059,
+    "mae_climatology_mean": 3.694,
+    "mae_fao_mean": 1.905,
+    "recommended_alarm_c": 1.5,
+    "frost_recall_mean": 0.755,
+    "frost_precision_mean": 0.628,
+    "alarm_threshold_sweep": {
+      "0.0": {
+        "recall": 0.524,
+        "precision": 0.807
+      },
+      "0.5": {
+        "recall": 0.612,
+        "precision": 0.743
+      },
+      "1.0": {
+        "recall": 0.689,
+        "precision": 0.699
+      },
+      "1.5": {
+        "recall": 0.755,
+        "precision": 0.628
+      },
+      "2.0": {
+        "recall": 0.834,
+        "precision": 0.591
+      }
+    },
+    "per_fold": [
+      {
+        "fold": "pl_inowroclaw",
+        "n_test": 666,
+        "mae_model": 1.645,
+        "rmse_model": 2.08,
+        "mae_climatology": 3.806,
+        "mae_fao": 1.88,
+        "frost_recall": 0.822,
+        "frost_precision": 0.709
+      },
+      {
+        "fold": "pl_krzesiny_poznan",
+        "n_test": 759,
+        "mae_model": 1.744,
+        "rmse_model": 2.254,
+        "mae_climatology": 3.822,
+        "mae_fao": 2.021,
+        "frost_recall": 0.794,
+        "frost_precision": 0.662
+      },
+      {
+        "fold": "pl_leczyca",
+        "n_test": 759,
+        "mae_model": 1.655,
+        "rmse_model": 2.078,
+        "mae_climatology": 3.969,
+        "mae_fao": 1.915,
+        "frost_recall": 0.952,
+        "frost_precision": 0.622
+      },
+      {
+        "fold": "pl_lublinek_lodz",
+        "n_test": 767,
+        "mae_model": 1.857,
+        "rmse_model": 2.323,
+        "mae_climatology": 4.293,
+        "mae_fao": 2.255,
+        "frost_recall": 0.78,
+        "frost_precision": 0.78
+      },
+      {
+        "fold": "pl_tomaszow",
+        "n_test": 759,
+        "mae_model": 1.71,
+        "rmse_model": 2.132,
+        "mae_climatology": 4.113,
+        "mae_fao": 1.99,
+        "frost_recall": 0.873,
+        "frost_precision": 0.683
+      },
+      {
+        "fold": "uk_cranwell",
+        "n_test": 766,
+        "mae_model": 1.397,
+        "rmse_model": 1.809,
+        "mae_climatology": 3.139,
+        "mae_fao": 1.676,
+        "frost_recall": 0.569,
+        "frost_precision": 0.617
+      },
+      {
+        "fold": "uk_manchester",
+        "n_test": 767,
+        "mae_model": 1.882,
+        "rmse_model": 2.282,
+        "mae_climatology": 3.306,
+        "mae_fao": 1.904,
+        "frost_recall": 0.475,
+        "frost_precision": 0.571
+      },
+      {
+        "fold": "uk_waddington",
+        "n_test": 764,
+        "mae_model": 1.21,
+        "rmse_model": 1.514,
+        "mae_climatology": 3.101,
+        "mae_fao": 1.601,
+        "frost_recall": 0.774,
+        "frost_precision": 0.381
+      }
+    ]
+  }
+}
