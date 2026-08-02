@@ -142,10 +142,3 @@ python3 train.py          # evaluate; writes data/metrics.json
 
 `train.py --help` and the `tests/` scripts (timing probes, the feature-
 improvement experiment bench) document how the pipeline was validated.
-
----
-
-*This project began as a cloud-cover classifier; that surface-data target hit a
-physical ceiling and was set aside (see `_cloud_cover_archive/`). Frost is the
-case where the same instruments and pipeline point at a question the data can
-actually answer — and one a grower can use.*
