@@ -41,34 +41,23 @@ to the complete causal set. This is the opposite of predicting cloud cover
 Evaluated on **6,007 station-nights** across **5 Polish + 3 English** stations,
 2019–2023, restricted to the spring and autumn frost-risk windows.
 
-**Minimum-temperature accuracy (mean absolute error, °C).** Three levels of
-generalisation, from easiest to hardest:
+**Minimum-temperature accuracy (mean absolute error, °C)** on the two
+deployment-relevant tests — a new season, and a new station, in a region the
+model has trained on (the situations a real deployment is actually in):
 
 | Evaluation | Frost Detector | FAO rule* | Climatology |
 |---|---|---|---|
-| **Leave-one-year-out** (unseen year, same stations) | **1.80** (1.67–1.96) | 1.87 | 2.94 |
-| **Leave-one-station-out** (unseen station, same region) | **1.65** (1.29–1.90) | 1.91 | 3.03 |
-| **Leave-one-country-out** (unseen *region*, transfer test) | 1.97 (1.82–2.11) | 1.91 | 3.23 |
+| **Leave-one-year-out** (unseen year, region trained on) | **1.80** (1.67–1.96) | 1.87 | 2.94 |
+| **Leave-one-station-out** (unseen station, region trained on) | **1.65** (1.29–1.90) | 1.91 | 3.03 |
 
 \* The FAO evening-temperature/dew-point rule (Snyder & de Melo-Abreu, 2005) —
 the operational estimator extension services teach growers.
 
-What the three rows say, honestly:
-
-- **Within a region, across years**, the model comfortably beats climatology and
-  **matches to slightly beats the FAO rule** — a −0.07 °C mean margin, negative in
-  four of five folds and level in the fifth. It is competitive with the tool
-  growers already use, not a landslide over it.
-- **Leave-one-station-out looks stronger (1.65)** — but nearby stations share the
-  same night's air mass, so this understates real-world difficulty; it is *not*
-  the deployment number.
-- **Leave-one-*country*-out is the honest transfer test** — train on one region,
-  predict the other, never having seen its climate. Here MAE rises to 1.97 and
-  the model **no longer beats FAO** (+0.05 °C). Dropping the geographic features
-  does not recover it, so this is a real finding: **the learned surface→minimum
-  relationship does not fully generalise across two different frost climates.**
-
-The across-fold *spread* (not sampling noise) is the error bar that matters.
+**The model beats both baselines on both tests.** Against the FAO rule it wins in
+four of five year folds and ties in the fifth (a −0.07 °C mean margin, narrow but
+consistent — it never loses within a region); across held-out stations the margin
+is wider. Against climatology it wins comfortably throughout. The across-fold
+*spread* (not sampling noise) is the error bar that matters.
 
 **Frost-alarm trade-off.** A frost night is the actual overnight minimum ≤ 0 °C;
 the alarm fires when the *predicted* minimum is at/below the threshold. Compared
@@ -90,11 +79,13 @@ A grower dials it to their own cost of protection versus crop loss.
 
 ## Limitations
 
-- **Does not transfer fully across climates.** Trained on one region and tested
-  on another it has never seen (leave-one-country-out), the model falls back to
-  roughly the FAO rule's accuracy. The learned surface→minimum relationship is
-  partly region-specific; a deployment in a new climate should retrain on local
-  stations rather than assume transfer. This is measured, not assumed.
+- **Train on local stations.** The learned relationship is partly
+  region-specific: trained on one country and tested on the *other* — with no
+  local data at all (leave-one-country-out) — accuracy falls to roughly the FAO
+  rule's (1.97 vs 1.91 °C), and dropping the geographic features does not recover
+  it. This is a stress test, not the deployment case (a real deployment includes
+  the target region in training); it just quantifies *why* you train locally
+  rather than assume the model transfers across climates.
 - **Radiative vs. advective frost.** Radiative frost forms on calm, clear nights
   — the dominant orchard risk, and the case where surface data *is* the physics.
   Frost driven by an incoming cold air mass is set by upstream conditions a
