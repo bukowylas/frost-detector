@@ -10,7 +10,7 @@ output row is therefore ONE NIGHT:
 with the 18:00-20:00 window excluded from both, so no feature is contemporaneous
 with the label period (the core anti-leakage rule -- see README / consult notes).
 
-Design decisions made here (documented so they can be revisited / reviewed):
+Design decisions made here (documented so they can be revisited):
 
 - **Local Standard Time, not UTC and not DST.** The whole task pivots on the
   day/night boundary; a UTC cutoff would smear it by the station's offset. We use
@@ -31,9 +31,8 @@ Design decisions made here (documented so they can be revisited / reviewed):
   analysis can separate radiative from advective frost later.
 
 Reads every ``isd_*.csv`` under ``data_raw/`` (offline) and writes
-``data/nights.csv`` (one row per station-night) plus a coverage report. The ISD
-field decoding (sentinels + quality flags) is carried over verified from the
-prior project.
+``data/nights.csv`` (one row per station-night) plus a coverage report. ISD
+field decoding honours the missing-value sentinels and quality flags.
 """
 
 from __future__ import annotations
@@ -60,12 +59,11 @@ LABEL_END_HOUR = 8         # overnight-min window end (next morning)
 RISK_WINDOWS = [((3, 1), (5, 31)), ((9, 15), (11, 15))]
 
 # --- ISD packed-field decoding ----------------------------------------------
-# Reject suspect (2, 6) and erroneous (3, 7) quality flags. Flag '9' is NOT
-# rejected here, but that is moot in practice: verified across all 40 frost
-# station-years, EVERY flag-'9' TMP/DEW row also carries the missing sentinel
-# (+9999) and is dropped by the sentinel check anyway -- 0 flag-'9' rows carry a
-# real value. So whatever '9' denotes (likely "QC not applied"), no unchecked
-# value enters the model. (See tests/check_flag9.py.)
+# Reject suspect (2, 6) and erroneous (3, 7) quality flags. Flag '9' (likely
+# "QC not applied") is not listed, but this admits no unchecked data: in this
+# dataset every flag-'9' temperature/dew-point row also carries the missing
+# sentinel (+9999), so the sentinel check drops it regardless. (tests/check_flag9.py
+# checks this holds for the current stations.)
 _BAD_QUALITY_FLAGS = {"2", "6", "3", "7"}
 
 
@@ -103,8 +101,7 @@ def _wind_speed_ms(raw) -> float:
 
 def _cloud_oktas(raw) -> float:
     """GA1 lowest-layer coverage in oktas (0-8), or NaN. Clear sky (low oktas)
-    favours radiative cooling, so this is a real frost signal even though it was
-    a poor *target* in the prior project."""
+    favours radiative cooling, so cloud cover is a frost signal."""
     parts = _packed(raw)
     if not parts:
         return math.nan
@@ -208,12 +205,9 @@ def build_nights(obs: pd.DataFrame) -> pd.DataFrame:
             at_24h = _nearest_at_or_before(window, cutoff - pd.Timedelta(hours=24))
 
             # Radiative-cooling potential: clear + calm favours strong nocturnal
-            # radiative cooling (the dominant driver of orchard frost). One
-            # physically-motivated number = (clear fraction) / (1 + wind). This
-            # was the winning feature in the improvement experiments (a small but
-            # consistent gain over the raw cloud/wind features). Missing cloud ->
-            # mid (4 oktas), missing wind -> a light 3 m/s, matching the tested
-            # convention.
+            # radiative cooling (the dominant driver of orchard frost), expressed
+            # as one number = (clear fraction) / (1 + wind). Missing cloud -> mid
+            # (4 oktas), missing wind -> a light 3 m/s.
             cloud = at["cloud_oktas"] if pd.notna(at["cloud_oktas"]) else 4.0
             wind = at["wind_ms"] if pd.notna(at["wind_ms"]) else 3.0
             radiative_potential = (1.0 - cloud / 8.0) / (1.0 + wind)

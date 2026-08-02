@@ -36,7 +36,8 @@ from __future__ import annotations
 import os
 import time
 
-# One level of parallelism only (see prior project); cap OpenMP before sklearn.
+# Parallelise at one level only (the outer CV); cap OpenMP before sklearn so the
+# native-threaded estimators don't oversubscribe the cores.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import json

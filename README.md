@@ -85,8 +85,7 @@ cost of protection versus cost of crop loss.
   model would otherwise **under-warn** for exactly the sites that need warning.
 - **What it does not replace.** National met services (e.g. IMGW in Poland)
   issue frost forecasts backed by numerical weather prediction and upper-air
-  data this project does not use. Frost Detector's niche is a cheap,
-  site-specific, reproducible statistical model from free surface data alone.
+  data this project does not use.
 
 ## How it works (pipeline)
 
