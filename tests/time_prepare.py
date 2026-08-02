@@ -24,7 +24,7 @@ t_decode = time.monotonic() - t0
 print(f"decode: {len(obs)} obs in {t_decode:.1f}s", flush=True)
 
 t1 = time.monotonic()
-nights = prepare.build_nights(obs)
+nights, _rejected = prepare.build_nights(obs)
 t_build = time.monotonic() - t1
 print(f"build_nights: {len(nights)} nights in {t_build:.1f}s", flush=True)
 

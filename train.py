@@ -12,20 +12,23 @@ thresholds, and MAE in C is a self-interpreting, checkable metric.
 Evaluation is honest by construction:
 
 - **Leave-one-year-out (LOYO)** is the headline. Year-to-year variability is the
-  dominant uncertainty for a weather target, so the honest error bar is the
+  dominant uncertainty for a weather target, so the error bar that matters is the
   SPREAD of MAE across held-out years, not a single pooled split.
-- **Leave-one-station-out (LOSO)** is the harder deployment test: predict at a
-  station never seen in training (a grower whose nearest station wasn't in the
-  data).
+- **Leave-one-station-out (LOSO)** holds out one station at a time -- but nearby
+  stations share the same night's air mass, so this understates difficulty.
+- **Leave-one-country-out (LOCO)** is the genuine transfer test: train on one
+  region, predict the other, never having seen its air masses -- run with and
+  without the geographic features (which are pure extrapolation across a border).
 - Two REAL baselines, not a dummy:
-  1. **Climatology** -- the station's mean tmin for that day-of-year.
+  1. **Climatology** -- a per-station-month mean tmin (pooled-month fallback for
+     an unseen station).
   2. **The FAO rule** tmin = a*temp + b*dewpoint + c (Snyder & de Melo-Abreu,
      2005), the operational evening-dewpoint estimator extension services teach.
-  Both are FIT ON TRAINING YEARS ONLY inside each fold -- fitting them over all
-  data would leak the held-out year's climate.
+  Both are FIT ON TRAINING data ONLY inside each fold -- fitting them over all
+  data would leak the held-out period's climate.
 
-Speed: HistGradientBoosting (fast, native NaN); a small randomized search; LOYO
-is only ~5 folds. Progress + ETA printed throughout.
+Speed: HistGradientBoosting (fast, native NaN) and a small randomized search
+per fold; progress + ETA printed throughout.
 
 Usage:
     python3 train.py
@@ -41,6 +44,7 @@ import time
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -71,7 +75,15 @@ FROST_TRUTH_C = 0.0
 # alarms early, at +1.5 C predicted.
 ALARM_THRESHOLDS_C = [0.0, 0.5, 1.0, 1.5, 2.0]
 RECOMMENDED_ALARM_C = 1.5
+# Evening wind speed (m/s) separating the calm, radiative-cooling regime from
+# the windier, advection-prone regime. Radiative frost (calm) is what surface
+# data predicts well; the split makes the difference measurable.
+CALM_WIND_MS = 2.0
 RANDOM_STATE = 42
+
+assert RECOMMENDED_ALARM_C in ALARM_THRESHOLDS_C, (
+    "RECOMMENDED_ALARM_C must be one of ALARM_THRESHOLDS_C"
+)
 
 _t0 = time.monotonic()
 
@@ -85,20 +97,46 @@ def rmse(y_true, y_pred) -> float:
     return float(np.sqrt(np.mean((np.asarray(y_true) - np.asarray(y_pred)) ** 2)))
 
 
+def _clean_nan(obj):
+    """Recursively replace NaN floats with None so the output is valid JSON.
+
+    A bare NaN token is not valid JSON (jq, JS, R's jsonlite all reject it) even
+    though Python's json.loads accepts it.
+    """
+    if isinstance(obj, dict):
+        return {k: _clean_nan(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_nan(v) for v in obj]
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    return obj
+
+
+def _dump_json(summary) -> str:
+    # allow_nan=False so anything that slips through _clean_nan fails loudly.
+    return json.dumps(_clean_nan(summary), indent=2, allow_nan=False)
+
+
 # --- baselines (fit train-only inside each fold) ----------------------------
 
 
 def climatology_predict(train: pd.DataFrame, test: pd.DataFrame) -> np.ndarray:
-    """Per-station mean tmin by day-of-year, smoothed to a per-station mean.
+    """Per-station-month mean tmin (a stable seasonal climatology normal).
 
-    Fit on train rows only. Falls back to the station's overall mean (then the
-    global mean) when a station/day-of-year combination is unseen in training.
+    Fit on train rows only. Falls back, in order, to the station's overall mean,
+    then a pooled month mean across training stations (for an unseen station),
+    then the global mean.
     """
     global_mean = train[TARGET].mean()
     by_station = train.groupby("station")[TARGET].mean()
     # day-of-year is noisy per station; use a per-station-month mean as a stable
     # climatological normal (a full doy curve would overfit with ~5 years).
     by_station_month = train.groupby(["station", "month"])[TARGET].mean()
+    # Fallback for an UNSEEN station (leave-one-station-out): a pooled month mean
+    # across the training stations -- still a real seasonal climatology. Without
+    # this, an unseen station would collapse to the grand mean and make the
+    # baseline artificially weak (inflating the model's margin).
+    by_month = train.groupby("month")[TARGET].mean()
     preds = []
     for _, row in test.iterrows():
         key = (row["station"], row["month"])
@@ -106,6 +144,8 @@ def climatology_predict(train: pd.DataFrame, test: pd.DataFrame) -> np.ndarray:
             preds.append(by_station_month[key])
         elif row["station"] in by_station.index:
             preds.append(by_station[row["station"]])
+        elif row["month"] in by_month.index:
+            preds.append(by_month[row["month"]])
         else:
             preds.append(global_mean)
     return np.array(preds, dtype=float)
@@ -176,83 +216,144 @@ def tuned_model(X: pd.DataFrame, y: pd.Series) -> HistGradientBoostingRegressor:
     return search.best_estimator_
 
 
-def evaluate_fold(train, test, label):
-    """Fit model + baselines on train, score all three on test (MAE, RMSE)."""
-    model = tuned_model(train[FEATURES], train[TARGET])
+def evaluate_fold(train, test, label, features=FEATURES):
+    """Fit model + baselines on train, score all three on test.
+
+    Returns per-fold MAE/RMSE plus the raw prediction arrays, so the caller can
+    pool predictions across folds (the honest way to compute frost recall/
+    precision when fold base rates differ) and compute paired model-vs-FAO
+    margins.
+    """
+    model = tuned_model(train[features], train[TARGET])
     y_true = test[TARGET].to_numpy()
-    y_model = model.predict(test[FEATURES])
+    y_model = model.predict(test[features])
     y_clim = climatology_predict(train, test)
     y_fao = fao_predict(train, test)
+    wind = test["wind_ms"].to_numpy()
 
-    # Frost decision layer: a frost night is truth <= 0 C; the alarm fires when
-    # the PREDICTED minimum is at/below each alarm threshold. Sweep thresholds so
-    # the recall/precision trade-off is visible.
-    true_frost = y_true <= FROST_TRUTH_C
-    alarms = {}
-    for thr in ALARM_THRESHOLDS_C:
-        pred_alarm = y_model <= thr
-        tp = int((true_frost & pred_alarm).sum())
-        fn = int((true_frost & ~pred_alarm).sum())
-        fp = int((~true_frost & pred_alarm).sum())
-        alarms[thr] = {
-            "recall": tp / (tp + fn) if (tp + fn) else float("nan"),
-            "precision": tp / (tp + fp) if (tp + fp) else float("nan"),
-        }
+    # Error sliced by wind regime. Radiative frost forms on calm nights (surface
+    # data is the physics); advective frost is driven by an incoming air mass a
+    # single station cannot see, so a surface-only model should be weaker there.
+    # Nights with missing wind fall in NEITHER slice (NaN fails both comparisons),
+    # so the two counts won't sum to n_test -- we report all three.
+    calm = wind <= CALM_WIND_MS
+    windy = wind > CALM_WIND_MS
+    mae_calm = (mean_absolute_error(y_true[calm], y_model[calm])
+                if calm.any() else float("nan"))
+    mae_windy = (mean_absolute_error(y_true[windy], y_model[windy])
+                 if windy.any() else float("nan"))
 
-    rec = alarms[RECOMMENDED_ALARM_C]
     return {
         "fold": label,
+        "n_train": len(train),
         "n_test": len(test),
         "mae_model": mean_absolute_error(y_true, y_model),
         "rmse_model": rmse(y_true, y_model),
         "mae_climatology": mean_absolute_error(y_true, y_clim),
         "mae_fao": mean_absolute_error(y_true, y_fao),
-        # headline frost metrics at the recommended alarm threshold
-        "frost_recall": rec["recall"],
-        "frost_precision": rec["precision"],
-        # full sweep for the trade-off table
-        "alarm_sweep": alarms,
+        "mae_margin_vs_fao": (mean_absolute_error(y_true, y_model)
+                              - mean_absolute_error(y_true, y_fao)),
+        "mae_calm": mae_calm,
+        "mae_windy": mae_windy,
+        "n_calm": int(calm.sum()),
+        "n_windy": int(windy.sum()),
+        "n_wind_missing": int(np.isnan(wind).sum()),
+        # raw arrays for pooled frost-alarm metrics and paired stats
+        "_y_true": y_true,
+        "_y_model": y_model,
+        "_y_fao": y_fao,
     }
 
 
-def run_cv(df, group_col, name):
+def _alarm_sweep(y_true, y_pred):
+    """Recall/precision at each alarm threshold, pooled over the given arrays.
+
+    Frost truth is tmin <= 0 C; the alarm fires when the PREDICTED tmin is at or
+    below the threshold.
+    """
+    true_frost = y_true <= FROST_TRUTH_C
+    out = {}
+    for thr in ALARM_THRESHOLDS_C:
+        pred = y_pred <= thr
+        tp = int((true_frost & pred).sum())
+        fn = int((true_frost & ~pred).sum())
+        fp = int((~true_frost & pred).sum())
+        out[thr] = {
+            "recall": tp / (tp + fn) if (tp + fn) else float("nan"),
+            "precision": tp / (tp + fp) if (tp + fp) else float("nan"),
+        }
+    return out
+
+
+def run_cv(df, group_col, name, features=FEATURES):
     """Leave-one-<group>-out: hold out each group value in turn."""
     groups = sorted(df[group_col].unique())
     step(f"{name}: {len(groups)} folds ...")
     results = []
+    run_start = time.monotonic()  # per-run, so a later run's ETA excludes earlier ones
     for i, held in enumerate(groups, start=1):
-        elapsed = time.monotonic() - _t0
-        eta = (elapsed / i * (len(groups) - i)) if i else 0
+        done = i - 1  # folds actually finished
+        eta = ((time.monotonic() - run_start) / done * (len(groups) - done)) if done else 0
         step(f"  [{i}/{len(groups)}] hold out {group_col}={held} "
              f"(~{eta:.0f}s left) ...")
         train = df[df[group_col] != held]
         test = df[df[group_col] == held]
-        results.append(evaluate_fold(train, test, str(held)))
+        results.append(evaluate_fold(train, test, str(held), features=features))
     return pd.DataFrame(results)
 
 
 def summarise(res: pd.DataFrame, name: str) -> dict:
+    mae = res["mae_model"]
     step(f"{name} summary:")
     for _, r in res.iterrows():
         step(f"    {r['fold']:>14s}  MAE {r['mae_model']:.2f}C  "
-             f"(clim {r['mae_climatology']:.2f}, FAO {r['mae_fao']:.2f})  "
-             f"frost recall {r['frost_recall']:.2f} prec {r['frost_precision']:.2f}")
-    mae = res["mae_model"]
+             f"(clim {r['mae_climatology']:.2f}, FAO {r['mae_fao']:.2f}, "
+             f"vs-FAO {r['mae_margin_vs_fao']:+.2f})  "
+             f"[train {r['n_train']}, test {r['n_test']}]")
     step(f"  {name} MAE: mean {mae.mean():.2f}C  spread {mae.min():.2f}-{mae.max():.2f}  "
          f"| clim {res['mae_climatology'].mean():.2f}  FAO {res['mae_fao'].mean():.2f}")
 
-    # Aggregate the alarm-threshold sweep across folds (mean recall/precision).
-    sweep = {}
-    step(f"  {name} frost-alarm trade-off (alarm when predicted tmin <= thr):")
-    for thr in ALARM_THRESHOLDS_C:
-        recalls = [r["alarm_sweep"][thr]["recall"] for _, r in res.iterrows()]
-        precs = [r["alarm_sweep"][thr]["precision"] for _, r in res.iterrows()]
-        r_mean, p_mean = float(np.nanmean(recalls)), float(np.nanmean(precs))
-        sweep[thr] = {"recall": round(r_mean, 3), "precision": round(p_mean, 3)}
-        star = "  <- recommended" if thr == RECOMMENDED_ALARM_C else ""
-        step(f"      alarm<={thr:+.1f}C  recall {r_mean:.2f}  precision {p_mean:.2f}{star}")
+    # Paired margin vs FAO: mean and range of (model - FAO) per fold. A tight,
+    # consistently-negative margin is the defensible "beats FAO" claim -- far
+    # stronger than comparing two means against a wide fold spread.
+    margin = res["mae_margin_vs_fao"]
+    step(f"  {name} margin vs FAO (model-FAO, per fold): mean {margin.mean():+.3f}C  "
+         f"range {margin.min():+.3f}..{margin.max():+.3f}")
 
-    slim = res.drop(columns=["alarm_sweep"])
+    # Error by wind regime (calm=radiative easier; windy=advective harder).
+    # Missing-wind nights are in neither slice, so the counts are shown too.
+    mae_calm = float(np.nanmean(res["mae_calm"]))
+    mae_windy = float(np.nanmean(res["mae_windy"]))
+    n_calm, n_windy = int(res["n_calm"].sum()), int(res["n_windy"].sum())
+    n_wmiss = int(res["n_wind_missing"].sum())
+    step(f"  {name} MAE by regime: calm (<= {CALM_WIND_MS} m/s) {mae_calm:.2f}C "
+         f"[n={n_calm}]  vs windy {mae_windy:.2f}C [n={n_windy}]  "
+         f"(wind missing: {n_wmiss})")
+
+    # Pool predictions across folds, then compute the frost-alarm sweep once on
+    # the pooled set -- an unweighted per-fold mean is not a rate anyone
+    # experiences when fold base rates differ. Sweep the FAO baseline too, so the
+    # grower-facing comparison (model+threshold vs FAO+threshold) actually exists.
+    y_true = np.concatenate(res["_y_true"].to_list())
+    y_model = np.concatenate(res["_y_model"].to_list())
+    y_fao = np.concatenate(res["_y_fao"].to_list())
+    sweep_model = _alarm_sweep(y_true, y_model)
+    sweep_fao = _alarm_sweep(y_true, y_fao)
+
+    step(f"  {name} frost-alarm trade-off, pooled (alarm when predicted tmin <= thr):")
+    step("      thr    model recall/prec     FAO recall/prec")
+    for thr in ALARM_THRESHOLDS_C:
+        m, f = sweep_model[thr], sweep_fao[thr]
+        star = "  <-" if thr == RECOMMENDED_ALARM_C else "    "
+        step(f"    {thr:+.1f}C   {m['recall']:.2f} / {m['precision']:.2f}"
+             f"        {f['recall']:.2f} / {f['precision']:.2f}{star}")
+
+    def round_sweep(s):
+        return {thr: {"recall": round(v["recall"], 3),
+                      "precision": round(v["precision"], 3)} for thr, v in s.items()}
+
+    slim = res.drop(columns=["_y_true", "_y_model", "_y_fao"])
+    rec = sweep_model[RECOMMENDED_ALARM_C]
     return {
         "mae_mean": round(float(mae.mean()), 3),
         "mae_min": round(float(mae.min()), 3),
@@ -260,10 +361,16 @@ def summarise(res: pd.DataFrame, name: str) -> dict:
         "rmse_mean": round(float(res["rmse_model"].mean()), 3),
         "mae_climatology_mean": round(float(res["mae_climatology"].mean()), 3),
         "mae_fao_mean": round(float(res["mae_fao"].mean()), 3),
+        "margin_vs_fao_mean": round(float(margin.mean()), 3),
+        "margin_vs_fao_min": round(float(margin.min()), 3),
+        "margin_vs_fao_max": round(float(margin.max()), 3),
+        "mae_calm_mean": round(mae_calm, 3),
+        "mae_windy_mean": round(mae_windy, 3),
         "recommended_alarm_c": RECOMMENDED_ALARM_C,
-        "frost_recall_mean": round(float(res["frost_recall"].mean()), 3),
-        "frost_precision_mean": round(float(res["frost_precision"].mean()), 3),
-        "alarm_threshold_sweep": sweep,
+        "frost_recall_pooled": round(rec["recall"], 3),
+        "frost_precision_pooled": round(rec["precision"], 3),
+        "alarm_sweep_model": round_sweep(sweep_model),
+        "alarm_sweep_fao": round_sweep(sweep_fao),
         "per_fold": slim.round(3).to_dict(orient="records"),
     }
 
@@ -272,19 +379,34 @@ def main() -> None:
     step("loading nights.csv ...")
     df = pd.read_csv(DATA)
     df["year"] = pd.to_datetime(df["date"]).dt.year
+    df["country"] = df["station"].str.slice(0, 2)  # pl / uk
     step(f"loaded {len(df)} nights, {df['station'].nunique()} stations, "
          f"years {sorted(df['year'].unique())}")
 
     loyo = run_cv(df, "year", "leave-one-year-out")
     loso = run_cv(df, "station", "leave-one-station-out")
+    # The honest deployment test: hold out a whole country cluster (train UK ->
+    # predict PL, and vice versa). Nearby stations share the same night's air
+    # mass, so leave-ONE-station-out understates difficulty when the other
+    # stations sit ~40 km away; leaving out the whole region removes that.
+    loco = run_cv(df, "country", "leave-one-country-out")
+    # Across a country boundary, lat/lon/elev are pure extrapolation (held-out
+    # region has no nearby training coordinate), so they can drag LOCO for a
+    # non-physical reason. Re-run LOCO without them to separate "surface physics
+    # doesn't transfer" from "the model is dragged by a coordinate it can't use".
+    no_geo = [f for f in FEATURES if f not in ("lat", "lon", "elev")]
+    loco_nogeo = run_cv(df, "country", "leave-one-country-out (no geo)",
+                        features=no_geo)
 
     summary = {
         "n_nights": len(df),
         "n_stations": int(df["station"].nunique()),
         "leave_one_year_out": summarise(loyo, "LOYO"),
         "leave_one_station_out": summarise(loso, "LOSO"),
+        "leave_one_country_out": summarise(loco, "LOCO"),
+        "leave_one_country_out_no_geo": summarise(loco_nogeo, "LOCO-nogeo"),
     }
-    (OUT_DIR / "metrics.json").write_text(json.dumps(summary, indent=2))
+    (OUT_DIR / "metrics.json").write_text(_dump_json(summary))
     step(f"wrote {OUT_DIR / 'metrics.json'}")
     step("done.")
 

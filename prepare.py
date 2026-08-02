@@ -38,6 +38,7 @@ field decoding honours the missing-value sentinels and quality flags.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -53,6 +54,7 @@ LST_OFFSET_HOURS = {"pl_": 1, "uk_": 0}
 CUTOFF_HOUR = 18            # features use observations at/just before this
 LABEL_START_HOUR = 20      # overnight-min window start (same evening)
 LABEL_END_HOUR = 8         # overnight-min window end (next morning)
+LATE_HOUR = 4              # a night must have an obs at/after this (near dawn)
 # The 18:00-20:00 gap between them is excluded from both by construction.
 
 # Frost-risk windows as (month, day) ranges, inclusive.
@@ -136,15 +138,27 @@ def _in_risk_window(month: int, day: int) -> bool:
 
 def decode_station(csv_path: Path) -> pd.DataFrame:
     """Decode one raw station-year CSV into LST-stamped hourly observations."""
-    usecols = ["STATION", "DATE", "LATITUDE", "LONGITUDE", "ELEVATION",
-               "TMP", "DEW", "SLP", "WND", "GA1"]
-    raw = pd.read_csv(csv_path, dtype=str, low_memory=False, usecols=usecols)
+    # GA1 (cloud) is an optional ISD group -- some station-years lack the column
+    # entirely -- so read only the columns actually present and fill the rest
+    # with NaN, rather than let usecols hard-fail and kill the whole run.
+    wanted = ["STATION", "DATE", "LATITUDE", "LONGITUDE", "ELEVATION",
+              "TMP", "DEW", "SLP", "WND", "GA1"]
+    header = pd.read_csv(csv_path, nrows=0).columns
+    present = [c for c in wanted if c in header]
+    raw = pd.read_csv(csv_path, dtype=str, low_memory=False, usecols=present)
+    for col in wanted:
+        if col not in raw.columns:
+            raw[col] = pd.NA
     station = _station_name(csv_path)
     # Start the frame from a length-carrying column; assigning a scalar to a
     # still-empty DataFrame would create a zero-length column and silently drop
     # every row (the station column would be empty, breaking the later groupby).
+    # Shift UTC to Local Standard Time, then drop the tz so the column is naive
+    # LST -- keeping a UTC tz-label on LST values is a trap for anything that
+    # later tz-converts or compares against a genuinely-UTC series.
     utc = pd.to_datetime(raw["DATE"], utc=True, errors="coerce")
-    out = pd.DataFrame({"lst": utc + pd.to_timedelta(_lst_offset(station), unit="h")})
+    lst = (utc + pd.to_timedelta(_lst_offset(station), unit="h")).dt.tz_localize(None)
+    out = pd.DataFrame({"lst": lst})
     out["station"] = station
     out["lat"] = pd.to_numeric(raw["LATITUDE"], errors="coerce")
     out["lon"] = pd.to_numeric(raw["LONGITUDE"], errors="coerce")
@@ -157,14 +171,19 @@ def decode_station(csv_path: Path) -> pd.DataFrame:
     return out.dropna(subset=["lst"])
 
 
-def _nearest_at_or_before(day_obs: pd.DataFrame, target, tol_minutes=90):
+def _nearest_at_or_before(day_obs: pd.DataFrame, target, tol_minutes=90,
+                          require_col=None):
     """The last observation at or before `target`, within a tolerance.
 
     ISD reports irregularly (2-3x/hour with gaps), so 'the 18:00 value' is really
     'the most recent observation by 18:00'. A tolerance guards against using a
-    stale value across a long data gap.
+    stale value across a long data gap. If ``require_col`` is given, only rows
+    with a non-null value in that column are considered -- so a partial report
+    landing at 17:55 with no temperature doesn't shadow a good 17:30 reading.
     """
     prior = day_obs[day_obs["lst"] <= target]
+    if require_col is not None:
+        prior = prior[prior[require_col].notna()]
     if prior.empty:
         return None
     row = prior.iloc[-1]
@@ -173,7 +192,7 @@ def _nearest_at_or_before(day_obs: pd.DataFrame, target, tol_minutes=90):
     return row
 
 
-def build_nights(obs: pd.DataFrame) -> pd.DataFrame:
+def build_nights(obs: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
     """Collapse hourly observations into one row per (station, frost-risk night).
 
     For each station and each evening date D in a risk window, features come from
@@ -181,6 +200,7 @@ def build_nights(obs: pd.DataFrame) -> pd.DataFrame:
     minimum temperature in [20:00 LST D, 08:00 LST D+1].
     """
     rows = []
+    rejected: Counter = Counter()
     for station, g in obs.groupby("station", sort=False):
         g = g.sort_values("lst").reset_index(drop=True)
         lst = g["lst"]
@@ -189,6 +209,7 @@ def build_nights(obs: pd.DataFrame) -> pd.DataFrame:
         for day in dates:
             month, dom = day.month, day.day
             if not _in_risk_window(month, dom):
+                rejected["out_of_window"] += 1
                 continue
             cutoff = day + pd.Timedelta(hours=CUTOFF_HOUR)
             label_start = day + pd.Timedelta(hours=LABEL_START_HOUR)
@@ -197,12 +218,18 @@ def build_nights(obs: pd.DataFrame) -> pd.DataFrame:
             # Features: observation window up to the cutoff (last 30 h, so 24 h
             # trends are available).
             window = g[(lst >= cutoff - pd.Timedelta(hours=30)) & (lst <= cutoff)]
-            at = _nearest_at_or_before(window, cutoff)
-            if at is None or pd.isna(at["temp_c"]) or pd.isna(at["dewpoint_c"]):
-                continue  # no trustworthy evening snapshot -> no example
+            at = _nearest_at_or_before(window, cutoff, require_col="temp_c")
+            if at is None or pd.isna(at["dewpoint_c"]):
+                rejected["no_evening_snapshot"] += 1
+                continue
 
-            at_3h = _nearest_at_or_before(window, cutoff - pd.Timedelta(hours=3))
-            at_24h = _nearest_at_or_before(window, cutoff - pd.Timedelta(hours=24))
+            # Trend lookups require a real value in the column being differenced,
+            # so a valueless partial report doesn't shadow an earlier good reading.
+            lag3 = cutoff - pd.Timedelta(hours=3)
+            lag24 = cutoff - pd.Timedelta(hours=24)
+            at_3h_t = _nearest_at_or_before(window, lag3, require_col="temp_c")
+            at_24h_t = _nearest_at_or_before(window, lag24, require_col="temp_c")
+            at_3h_p = _nearest_at_or_before(window, lag3, require_col="slp_hpa")
 
             # Radiative-cooling potential: clear + calm favours strong nocturnal
             # radiative cooling (the dominant driver of orchard frost), expressed
@@ -212,11 +239,21 @@ def build_nights(obs: pd.DataFrame) -> pd.DataFrame:
             wind = at["wind_ms"] if pd.notna(at["wind_ms"]) else 3.0
             radiative_potential = (1.0 - cloud / 8.0) / (1.0 + wind)
 
-            # Label: overnight minimum temperature.
+            # Label: overnight minimum temperature. The true minimum usually
+            # falls near dawn, so a night observed only in the evening would give
+            # a warm-biased label -- an under-warning error, the worst kind here.
+            # Require at least one observation late in the window (after
+            # LATE_HOUR LST) as well as a minimum count. Accepted trade-off: this
+            # bounds *coverage near dawn* but not gaps within the window, so a
+            # night sampled 20:00 / 23:00 / 04:05 still passes and could miss a
+            # 05:30 minimum -- diminishing returns to police further.
             night = g[(lst >= label_start) & (lst <= label_end)]
-            night_temps = night["temp_c"].dropna()
-            if len(night_temps) < 3:
-                continue  # too few overnight obs to trust the minimum
+            night_obs = night.dropna(subset=["temp_c"])
+            night_temps = night_obs["temp_c"]
+            late = night_obs["lst"] >= (day + pd.Timedelta(days=1, hours=LATE_HOUR))
+            if len(night_temps) < 3 or not late.any():
+                rejected["no_late_obs"] += 1
+                continue  # too few / no late (near-dawn) obs -> untrustworthy min
             tmin = float(night_temps.min())
 
             def trend(col, past_row, now_row=at):
@@ -239,13 +276,13 @@ def build_nights(obs: pd.DataFrame) -> pd.DataFrame:
                 "cloud_oktas": float(at["cloud_oktas"]) if pd.notna(at["cloud_oktas"]) else math.nan,
                 "radiative_potential": float(radiative_potential),
                 # trends (cheap synoptic / advection signal)
-                "temp_change_3h": trend("temp_c", at_3h),
-                "temp_change_24h": trend("temp_c", at_24h),
-                "slp_tendency_3h": trend("slp_hpa", at_3h),
+                "temp_change_3h": trend("temp_c", at_3h_t),
+                "temp_change_24h": trend("temp_c", at_24h_t),
+                "slp_tendency_3h": trend("slp_hpa", at_3h_p),
                 # label
                 "tmin_overnight_c": tmin,
             })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), rejected
 
 
 def main() -> None:
@@ -258,9 +295,18 @@ def main() -> None:
     obs = pd.concat([decode_station(p) for p in csv_paths], ignore_index=True)
     print(f"  {len(obs)} hourly observations decoded", flush=True)
 
-    nights = build_nights(obs)
+    nights, rejected = build_nights(obs)
     print(f"  built {len(nights)} station-night examples "
           f"(frost-risk windows only)", flush=True)
+
+    # Coverage report: why candidate nights were rejected (out-of-window nights
+    # are expected; the others show what the quality filters cost).
+    print("  candidate nights rejected:", flush=True)
+    for reason, n in rejected.most_common():
+        print(f"    {reason:22s} {n}", flush=True)
+
+    if nights.empty:
+        raise SystemExit("no usable nights -- see the rejection counts above")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     nights.to_csv(OUT_DIR / "nights.csv", index=False)

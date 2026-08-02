@@ -118,7 +118,8 @@ def main() -> None:
         "--stations",
         nargs="+",
         default=None,
-        help="ISD station ids (default: the built-in verified set)",
+        help="stations as name=id, e.g. pl_lublin=12345099999 "
+             "(default: the built-in verified set)",
     )
     ap.add_argument(
         "--force",
@@ -127,7 +128,21 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    stations = {sid: sid for sid in args.stations} if args.stations else DEFAULT_STATIONS
+    # An override must be given as name=id (e.g. pl_lublin=12345099999): the
+    # name prefix (pl_/uk_) carries the LST offset the prepare step needs, so a
+    # bare id would produce files prepare.py cannot place in a time zone.
+    if args.stations:
+        stations = {}
+        for spec in args.stations:
+            if "=" not in spec:
+                raise SystemExit(
+                    f"--stations entries must be name=id (got {spec!r}); the "
+                    "name prefix pl_/uk_ sets the local-standard-time offset."
+                )
+            name, sid = spec.split("=", 1)
+            stations[name] = sid
+    else:
+        stations = DEFAULT_STATIONS
     jobs = [(name, sid, year) for name, sid in stations.items() for year in args.years]
 
     # Skip already-downloaded files up front, so the pool only does real work.
