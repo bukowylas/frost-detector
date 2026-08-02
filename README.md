@@ -12,7 +12,7 @@ benchmarked against the operational rule agricultural extension services
 actually teach, and it beats it — modestly but consistently — across held-out
 years and at stations it has never seen.
 
-## Why this problem
+## Background
 
 Spring frost after budbreak is the classic catastrophe for orchards and vines —
 a single night can destroy a season's fruit. Growers need a few hours' warning
@@ -36,7 +36,7 @@ to the complete causal set. This is the opposite of predicting cloud cover
   responses; predicting the temperature lets the same model serve every crop's
   damage threshold without retraining.
 
-## Results (honest, leave-out evaluation)
+## Results
 
 Evaluated on **6,007 station-nights** across **5 Polish + 3 English** stations,
 2019–2023, restricted to the spring and autumn frost-risk windows.
@@ -53,8 +53,8 @@ the operational estimator extension services teach growers.
 
 The model beats both baselines in **every fold**, including at stations held
 entirely out of training (the real deployment case: a grower whose nearest
-station wasn't in the data). The across-year *spread* is the honest error bar:
-year-to-year variability, not sampling noise, dominates.
+station wasn't in the data). The across-year *spread* is the error bar that
+matters: year-to-year variability, not sampling noise, dominates.
 
 **Frost-alarm trade-off (leave-one-year-out).** A frost night is defined by the
 actual overnight minimum ≤ 0 °C; the alarm fires when the *predicted* minimum is
@@ -71,7 +71,7 @@ At the +1.5 °C default the model catches **three frost nights in four**. The
 threshold is a deliberate, adjustable decision: a grower dials it to their own
 cost of protection versus cost of crop loss.
 
-## Honest limitations
+## Limitations
 
 - **Radiative vs. advective frost.** The model is strong on radiative frost
   (calm, clear nights — the dominant orchard risk). Frost driven by a cold air
@@ -107,7 +107,7 @@ NOAA ISD CSVs      one row per            HistGradientBoosting regressor
    3 h / 24 h trends and a radiative-cooling term), label = the minimum
    temperature 20:00 → 08:00 LST. An 18:00–20:00 gap keeps features and label
    from overlapping.
-3. **`train.py`** — fit and evaluate the regressor honestly: leave-one-year-out
+3. **`train.py`** — fit and evaluate the regressor: leave-one-year-out
    and leave-one-station-out, against the FAO and climatology baselines (both
    fit on training data only, inside each fold, to avoid leaking the held-out
    period's climate).
