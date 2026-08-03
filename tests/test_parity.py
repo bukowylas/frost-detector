@@ -56,8 +56,19 @@ EXACT_FEATURES = [
     "temp_change_3h", "temp_change_24h", "slp_tendency_3h",
     "lat", "lon", "elev", "month", "doy",
 ]
-FEATURE_TOL = 0.05   # generous vs float noise, far tighter than any real error
-PRED_TOL_C = 0.01    # live vs same-night cloud-blanked training forecast
+# Serviceable stations reproduce training to a tenth: temperature can differ by
+# one sub-tenth rounding step (0.1 C) between OGIMET's SYNOP and NCEI's ISD, which
+# round the same reading independently. 0.15 admits that step and nothing larger
+# -- the divergences that made stations unserviceable were 1-9 C, far outside it.
+FEATURE_TOL = 0.15
+# The live vs cloud-blanked-training forecast check confirms cloud is the only
+# MATERIAL difference. It cannot be bit-exact, because the permitted 0.1 C feature
+# rounding (above) propagates through the tree ensemble into the forecast -- a
+# 0.1 C input step moves a prediction by a few hundredths. 0.05 admits that
+# propagated rounding while still catching any real feature drift (which would
+# move the forecast by tenths to whole degrees), against a model whose MAE is
+# ~1.8 C.
+PRED_TOL_C = 0.05
 
 _OGIMET_COOLDOWN_S = 21
 _executed = {"count": 0}  # cases that actually ran their assertions (fail-closed)

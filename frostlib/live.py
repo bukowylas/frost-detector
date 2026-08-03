@@ -9,6 +9,18 @@ that its ISD training data was derived from -- tenths-of-a-degree temperature an
 dew point, and a sea-level pressure their METARs do not carry. The report is raw
 FM-12 code and is decoded here (``decode_synop``).
 
+SERVICEABLE STATIONS -- decided by the parity gate, not by ambition:
+    A station is served only where its live OGIMET feed provably reproduces the
+    NCEI-decoded training features (to a tenth of a degree). Of the eight training
+    stations, two UK stations (Waddington, Cranwell) meet that bar; the other six
+    do not, each for a verified reason recorded on ``UNSERVICED_STATIONS`` --
+    military-feed airfields with no civilian SYNOP, a station OGIMET does not
+    archive, and one where OGIMET and NCEI simply disagree on the observations.
+    Feeding the model another site's data, or a feed that does not match training,
+    is the precise failure this layer exists to prevent, so coverage stops where
+    parity stops. (NCEI's own archive lags ~1 year, so it cannot be the live
+    source; a real-time feed is required, and it is trusted only where it matches.)
+
 CLOUD -- a known, deliberate limitation, not a silent gap:
     Cloud cover is a genuine frost driver (clear, calm nights radiate heat away
     fastest -- that is when frost forms), so it is NOT a throwaway feature. But
@@ -48,29 +60,48 @@ KNOTS_TO_MS = 0.514444
 
 OGIMET_SYNOP_URL = "https://www.ogimet.com/cgi-bin/getsynop"
 
-# The stations the live service can serve: those whose real-time observations
-# are published to OGIMET's civilian SYNOP network under a WMO index that matches
-# the station the model was trained on. `wmo` is that verified index (NOT simply
-# the ISD USAF prefix -- those don't decode 1:1).
+# The stations the live service can serve: those whose real-time OGIMET SYNOP
+# observations provably reproduce the NCEI-decoded ISD features the model was
+# trained on. `wmo` is the verified civilian SYNOP index (NOT the ISD USAF prefix
+# -- those don't decode 1:1).
 #
-# Four of the eight training stations are deliberately absent: Tomaszow,
-# Inowroclaw, Leczyca and Krzesiny are Polish military airfields whose ISD
-# training data came from a military feed, not the civilian SYNOP network. They
-# have no live SYNOP report under a matching index (the nearest civilian index,
-# e.g. 12330 Lawica for Krzesiny, is a different station ~10 km away, which would
-# feed the model another site's observations). Rather than substitute a wrong
-# station, the live service does not cover them -- a real data-availability
-# boundary, stated plainly.
+# Live serviceability is decided by the parity gate, not by station count. Only
+# stations whose live feed matches training to a tenth of a degree are served;
+# a station is included here only after the parity test confirms it. The two UK
+# stations below reproduce temperature, dew point, sea-level pressure and wind
+# exactly (or within sub-tenth rounding) across cold, cyclonic and windy nights.
 PROVIDER = {
     "uk_waddington": {"wmo": "03377"},
     "uk_cranwell": {"wmo": "03379"},
-    "uk_manchester": {"wmo": "03334"},
-    "pl_lublinek_lodz": {"wmo": "12105"},
 }
 
-# Training stations not live-serviceable (see PROVIDER note), kept for reference.
+# Training stations that are NOT live-serviceable, each for a concrete, verified
+# reason. Serving any of these would feed the model data that is not the data it
+# was trained on -- the exact failure the parity gate exists to prevent.
+#
+#   Polish military airfields (Tomaszow, Inowroclaw, Leczyca, Krzesiny): their
+#     ISD training data came from a military feed, not the civilian SYNOP network,
+#     and they have no live SYNOP under a matching index (the nearest civilian
+#     index, e.g. 12330 Lawica for Krzesiny, is a different station ~10 km away).
+#
+#   Manchester (03334): OGIMET's civilian SYNOP archive carries no reports for it
+#     -- the parity fetch returns empty windows -- so there is no live feed to
+#     serve, matching or otherwise.
+#
+#   Lodz-Lublinek (12105): OGIMET's archived SYNOP and NCEI's ISD disagree on the
+#     instantaneous observations for this station (e.g. 2023-03-10 18:00: OGIMET
+#     temp 0.3 C vs training 9.5 C, with dew point and wind also diverging) while
+#     agreeing on pressure -- two providers rendering different values for the
+#     same station-hour. NCEI (training) is the meteorologically consistent one;
+#     OGIMET cannot reproduce it, so Lodz is not live-serviceable via this feed.
+#
+# NCEI's own archive is not an alternative live source: its global-hourly access
+# files lag ~1 year (the current-year file does not yet exist), far too stale for
+# a nightly forecast. A real-time feed is required, and where that feed does not
+# match training, the station is excluded rather than served with wrong data.
 UNSERVICED_STATIONS = (
     "pl_tomaszow", "pl_inowroclaw", "pl_leczyca", "pl_krzesiny_poznan",
+    "uk_manchester", "pl_lublinek_lodz",
 )
 
 # Static geography (lat/lon/elev), which build_feature_row carries onto the row.
@@ -78,8 +109,6 @@ UNSERVICED_STATIONS = (
 STATION_META = {
     "uk_waddington": {"lat": 53.166167, "lon": -0.523811, "elev": 70.4},
     "uk_cranwell": {"lat": 53.03035, "lon": -0.483242, "elev": 66.44},
-    "uk_manchester": {"lat": 53.353744, "lon": -2.27495, "elev": 78.33},
-    "pl_lublinek_lodz": {"lat": 51.717, "lon": 19.4, "elev": 184.0},
 }
 
 
