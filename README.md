@@ -165,3 +165,12 @@ python3 predict.py --temp 3.0 --dewpoint 0.5 --wind 1.5 --cloud 1 \
 
 `train.py --help` and the `tests/` scripts (timing probes, the feature-
 improvement experiment bench) document how the pipeline was validated.
+
+**Tests.** `tests/unit/` holds the unit suite (`pytest`, no network, no data
+files needed — every fixture is synthetic); the other `tests/` scripts are one-off
+investigation probes and are not collected.
+
+```
+python3 -m pytest                                     # unit suite
+python3 -m pytest --cov=. --cov-report=term-missing    # with coverage
+```

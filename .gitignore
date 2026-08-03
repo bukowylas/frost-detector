@@ -19,3 +19,7 @@ __pycache__/
 # Local cloud-cover archive (the prior project's superseded code; kept locally
 # for history, not part of the public Frost Detector repo).
 _cloud_cover_archive/
+
+# Coverage output.
+.coverage
+htmlcov/
