@@ -46,12 +46,68 @@ MODEL_PARAMS = {
 
 
 def fit_and_save() -> None:
+    if not DATA.exists():
+        raise SystemExit(f"{DATA} not found -- run `python3 prepare.py` first")
     df = pd.read_csv(DATA)
+    missing = [c for c in [*FEATURES, TARGET] if c not in df.columns]
+    if missing:
+        raise SystemExit(
+            f"{DATA} is missing required column(s) {missing} -- re-run "
+            "`python3 prepare.py`"
+        )
+    if df.empty or df[TARGET].isna().any():
+        raise SystemExit(
+            f"{DATA} has no usable rows ({len(df)} rows, "
+            f"{int(df[TARGET].isna().sum())} missing labels)"
+        )
     model = HistGradientBoostingRegressor(**MODEL_PARAMS)
     model.fit(df[FEATURES], df[TARGET])
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({"model": model, "features": FEATURES}, MODEL_PATH)
     print(f"fitted on {len(df)} nights; saved {MODEL_PATH}")
+
+
+# Physically impossible inputs are far more likely a typo or a unit mix-up than a
+# real observation. The model would still return a confident number for any of
+# them, so a frost alarm computed from a bad input would look exactly like a good
+# one -- reject them instead.
+_INPUT_BOUNDS = {
+    "temp": (-60.0, 60.0),
+    "dewpoint": (-60.0, 60.0),
+    "wind": (0.0, 120.0),
+    "cloud": (0.0, 8.0),
+    "pressure": (850.0, 1100.0),
+    "lat": (-90.0, 90.0),
+    "lon": (-180.0, 180.0),
+    "elev": (-500.0, 9000.0),
+    "doy": (1, 366),
+}
+
+
+def _validate(args, parser) -> None:
+    """Reject forecast inputs that are absent or physically impossible.
+
+    lat/lon/doy have no sensible default: left unset they reach the model as NaN,
+    which HistGradientBoosting accepts silently and turns into a prediction from a
+    site and season it was never told about.
+    """
+    for name in ("temp", "dewpoint", "lat", "lon", "doy"):
+        if getattr(args, name) is None:
+            parser.error(f"--{name} is required to forecast a night")
+
+    for name, (low, high) in _INPUT_BOUNDS.items():
+        value = getattr(args, name)
+        if value is not None and not low <= value <= high:
+            parser.error(f"--{name}={value} is outside the plausible range "
+                         f"[{low}, {high}]")
+
+    # Dew point above air temperature means supersaturation: a measurement or
+    # unit error. A small margin absorbs rounding in reported observations.
+    if args.dewpoint > args.temp + 0.5:
+        parser.error(
+            f"--dewpoint ({args.dewpoint} C) exceeds --temp ({args.temp} C); "
+            "dew point cannot be warmer than the air"
+        )
 
 
 def _derived(args) -> dict:
@@ -74,10 +130,38 @@ def _derived(args) -> dict:
     }
 
 
-def forecast(args) -> None:
+def _load_bundle() -> dict:
+    """Load the saved model, refusing anything stale or corrupt.
+
+    A truncated/foreign joblib file, or one saved by an older FEATURES list,
+    would otherwise either blow up deep inside sklearn or -- worse -- predict
+    from a feature set that no longer means what this script thinks it does.
+    """
     if not MODEL_PATH.exists():
         raise SystemExit("no saved model -- run `python3 predict.py --fit` first")
-    bundle = joblib.load(MODEL_PATH)
+    try:
+        bundle = joblib.load(MODEL_PATH)
+    except Exception as exc:
+        raise SystemExit(
+            f"could not load {MODEL_PATH} ({exc!r}) -- delete it and re-run "
+            "`python3 predict.py --fit`"
+        ) from exc
+    if not isinstance(bundle, dict) or not {"model", "features"} <= bundle.keys():
+        raise SystemExit(
+            f"{MODEL_PATH} is not a Frost Detector model bundle -- re-run "
+            "`python3 predict.py --fit`"
+        )
+    if list(bundle["features"]) != list(FEATURES):
+        raise SystemExit(
+            f"{MODEL_PATH} was fitted on a different feature set "
+            f"({bundle['features']}) than this code expects ({FEATURES}) -- "
+            "re-run `python3 predict.py --fit`"
+        )
+    return bundle
+
+
+def forecast(args) -> None:
+    bundle = _load_bundle()
     row = pd.DataFrame([_derived(args)])[bundle["features"]]
     tmin = float(bundle["model"].predict(row)[0])
     alarm = tmin <= RECOMMENDED_ALARM_C
@@ -106,10 +190,12 @@ def main() -> None:
 
     if args.fit:
         fit_and_save()
-    elif args.temp is not None and args.dewpoint is not None:
+    elif args.temp is not None or args.dewpoint is not None:
+        _validate(args, ap)
         forecast(args)
     else:
-        ap.error("either --fit, or provide at least --temp and --dewpoint")
+        ap.error("either --fit, or forecast inputs "
+                 "(--temp --dewpoint --lat --lon --doy)")
 
 
 if __name__ == "__main__":

@@ -93,6 +93,17 @@ def step(msg: str) -> None:
     print(f"[{int(mins):02d}:{secs:04.1f}] {msg}", flush=True)
 
 
+def _nanmean(values) -> float:
+    """Mean of the non-NaN entries, or NaN if there are none.
+
+    np.nanmean over an all-NaN slice emits a RuntimeWarning and returns NaN --
+    easy to lose in the run log; this makes the empty case explicit.
+    """
+    arr = np.asarray(values, dtype=float)
+    valid = arr[~np.isnan(arr)]
+    return float(valid.mean()) if valid.size else float("nan")
+
+
 def rmse(y_true, y_pred) -> float:
     return float(np.sqrt(np.mean((np.asarray(y_true) - np.asarray(y_pred)) ** 2)))
 
@@ -288,6 +299,14 @@ def _alarm_sweep(y_true, y_pred):
 def run_cv(df, group_col, name, features=FEATURES):
     """Leave-one-<group>-out: hold out each group value in turn."""
     groups = sorted(df[group_col].unique())
+    # With a single group every fold would have an empty training set, and the
+    # baselines would quietly return all-NaN predictions (a mean of nothing)
+    # rather than fail -- producing metrics that look computed but mean nothing.
+    if len(groups) < 2:
+        raise SystemExit(
+            f"{name}: need at least 2 distinct {group_col} values to hold one "
+            f"out, found {len(groups)} ({groups})"
+        )
     step(f"{name}: {len(groups)} folds ...")
     results = []
     run_start = time.monotonic()  # per-run, so a later run's ETA excludes earlier ones
@@ -298,6 +317,11 @@ def run_cv(df, group_col, name, features=FEATURES):
              f"(~{eta:.0f}s left) ...")
         train = df[df[group_col] != held]
         test = df[df[group_col] == held]
+        if train.empty or test.empty:
+            raise SystemExit(
+                f"{name}: fold {group_col}={held} has "
+                f"{len(train)} train / {len(test)} test rows -- cannot score it"
+            )
         results.append(evaluate_fold(train, test, str(held), features=features))
     return pd.DataFrame(results)
 
@@ -322,8 +346,8 @@ def summarise(res: pd.DataFrame, name: str) -> dict:
 
     # Error by wind regime (calm=radiative easier; windy=advective harder).
     # Missing-wind nights are in neither slice, so the counts are shown too.
-    mae_calm = float(np.nanmean(res["mae_calm"]))
-    mae_windy = float(np.nanmean(res["mae_windy"]))
+    mae_calm = _nanmean(res["mae_calm"])
+    mae_windy = _nanmean(res["mae_windy"])
     n_calm, n_windy = int(res["n_calm"].sum()), int(res["n_windy"].sum())
     n_wmiss = int(res["n_wind_missing"].sum())
     step(f"  {name} MAE by regime: calm (<= {CALM_WIND_MS} m/s) {mae_calm:.2f}C "
@@ -375,11 +399,47 @@ def summarise(res: pd.DataFrame, name: str) -> dict:
     }
 
 
+def load_nights() -> pd.DataFrame:
+    """Read data/nights.csv, failing loudly (and usefully) on anything unusable.
+
+    Every check here guards a failure that would otherwise be silent or
+    misleading: a missing file blamed on pandas rather than on the un-run prepare
+    step, a missing feature column surfacing much later as a bare KeyError, or
+    NaN labels/dates that sklearn and MAE would happily average into nonsense.
+    """
+    if not DATA.exists():
+        raise SystemExit(f"{DATA} not found -- run `python3 prepare.py` first")
+    df = pd.read_csv(DATA)
+    if df.empty:
+        raise SystemExit(f"{DATA} has no rows -- re-run `python3 prepare.py`")
+
+    missing = [c for c in [*FEATURES, TARGET, "station", "date", "month"]
+               if c not in df.columns]
+    if missing:
+        raise SystemExit(
+            f"{DATA} is missing required column(s) {missing} -- it was written by "
+            "an older prepare.py; re-run `python3 prepare.py`"
+        )
+
+    date = pd.to_datetime(df["date"], errors="coerce")
+    if date.isna().any():
+        raise SystemExit(
+            f"{DATA}: {int(date.isna().sum())} row(s) have an unparseable date; "
+            "they would be dropped from year folds without being noticed"
+        )
+    if df[TARGET].isna().any():
+        raise SystemExit(
+            f"{DATA}: {int(df[TARGET].isna().sum())} row(s) have no {TARGET} label"
+        )
+
+    df["year"] = date.dt.year
+    df["country"] = df["station"].str.slice(0, 2)  # pl / uk
+    return df
+
+
 def main() -> None:
     step("loading nights.csv ...")
-    df = pd.read_csv(DATA)
-    df["year"] = pd.to_datetime(df["date"]).dt.year
-    df["country"] = df["station"].str.slice(0, 2)  # pl / uk
+    df = load_nights()
     step(f"loaded {len(df)} nights, {df['station'].nunique()} stations, "
          f"years {sorted(df['year'].unique())}")
 

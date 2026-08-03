@@ -150,9 +150,15 @@ def main() -> None:
     skipped = 0
     for name, sid, year in jobs:
         out = RAW_DIR / f"isd_{name}_{sid}_{year}.csv"
-        if out.exists() and not args.force:
+        # Presence alone is not proof of a good download: an interrupted or
+        # out-of-disk write can leave an empty/header-only file, which would then
+        # be skipped for ever and reach prepare.py as "no data at this station".
+        if out.exists() and not args.force and out.stat().st_size > 1024:
             skipped += 1
         else:
+            if out.exists() and not args.force:
+                print(f"re-fetching {out.name}: existing file is only "
+                      f"{out.stat().st_size} bytes", flush=True)
             to_fetch.append((name, sid, year, out))
 
     t0 = time.monotonic()

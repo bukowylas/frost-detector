@@ -68,6 +68,13 @@ RISK_WINDOWS = [((3, 1), (5, 31)), ((9, 15), (11, 15))]
 # checks this holds for the current stations.)
 _BAD_QUALITY_FLAGS = {"2", "6", "3", "7"}
 
+# Decoding anomalies that are NOT ordinary missing data: tokens the ISD spec says
+# should be numeric but are not, and timestamps that will not parse. Each becomes
+# NaN (a single bad field must not abort a five-year run), but NaN-and-move-on
+# would make real corruption indistinguishable from an absent observation, so we
+# count them and report the totals at the end of the run.
+DECODE_ANOMALIES: Counter = Counter()
+
 
 def _packed(value: str) -> list[str]:
     return value.split(",") if isinstance(value, str) and value else []
@@ -86,6 +93,7 @@ def _scaled_num(raw, sentinel, scale, value_idx=0, flag_idx=1) -> float:
     try:
         return int(token) / scale
     except ValueError:
+        DECODE_ANOMALIES["unparseable_numeric_token"] += 1
         return math.nan
 
 
@@ -112,8 +120,14 @@ def _cloud_oktas(raw) -> float:
     try:
         code = int(parts[0])
     except ValueError:
+        DECODE_ANOMALIES["unparseable_cloud_token"] += 1
         return math.nan
-    return float(code) if 0 <= code <= 8 else math.nan
+    if not 0 <= code <= 8:
+        # 99 is the documented missing code; anything else is out of spec.
+        if code != 99:
+            DECODE_ANOMALIES["cloud_code_out_of_range"] += 1
+        return math.nan
+    return float(code)
 
 
 def _station_name(csv_path: Path) -> str:
@@ -168,7 +182,28 @@ def decode_station(csv_path: Path) -> pd.DataFrame:
     out["slp_hpa"] = raw["SLP"].map(_slp_hpa)
     out["wind_ms"] = raw["WND"].map(_wind_speed_ms)
     out["cloud_oktas"] = raw["GA1"].map(_cloud_oktas)
-    return out.dropna(subset=["lst"])
+
+    n_bad_dates = int(out["lst"].isna().sum())
+    if n_bad_dates:
+        DECODE_ANOMALIES["unparseable_timestamp"] += n_bad_dates
+    out = out.dropna(subset=["lst"])
+
+    # A station-year that decodes to nothing usable is a broken input file, not a
+    # data-coverage fact: without this it would vanish into the night-rejection
+    # counts (or, if every file were broken, into an empty output) with no hint of
+    # which file was at fault.
+    if out.empty:
+        raise ValueError(
+            f"{csv_path.name}: no rows with a parseable timestamp "
+            f"({len(raw)} rows read) -- the file looks truncated or is not ISD CSV"
+        )
+    if out["temp_c"].isna().all():
+        raise ValueError(
+            f"{csv_path.name}: no usable air temperature in {len(out)} rows "
+            "(all missing sentinels / rejected quality flags) -- "
+            "re-download this station-year"
+        )
+    return out
 
 
 def _nearest_at_or_before(day_obs: pd.DataFrame, target, tol_minutes=90,
@@ -294,6 +329,12 @@ def main() -> None:
     print(f"decoding {len(csv_paths)} station-years ...", flush=True)
     obs = pd.concat([decode_station(p) for p in csv_paths], ignore_index=True)
     print(f"  {len(obs)} hourly observations decoded", flush=True)
+
+    # Malformed fields are tolerated as NaN, but never in silence.
+    if DECODE_ANOMALIES:
+        print("  malformed fields decoded as missing:", flush=True)
+        for reason, n in DECODE_ANOMALIES.most_common():
+            print(f"    {reason:26s} {n}", flush=True)
 
     nights, rejected = build_nights(obs)
     print(f"  built {len(nights)} station-night examples "
