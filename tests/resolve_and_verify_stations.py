@@ -12,51 +12,41 @@ Usage:
 """
 
 import argparse
-import io
-import csv as csvmod
-import sys
-import time
 
-import pandas as pd
 import requests
+from _common import FROST_C, coverage, month_rows, temperatures
 
-UA = {"User-Agent": "frost-detector/0.1 (research; contact via README)"}
-t0 = time.monotonic()
+from frostlib import isd_history, net
+from frostlib.progress import Timer
 
+YEAR = 2023
+SPRING_MONTHS = ("04", "05")
 
-def log(msg: str) -> None:
-    print(f"[{time.monotonic() - t0:5.1f}s] {msg}", flush=True)
-
-
-def temp_ok(raw: str) -> bool:
-    p = raw.split(",") if raw else []
-    return len(p) > 1 and p[0] not in ("+9999", "9999") and p[1] not in ("2", "3", "6", "7")
+_timer = Timer()
+log = _timer.log
 
 
 def probe(usaf, wban, name):
     sid = f"{usaf}{wban}"
-    url = f"https://www.ncei.noaa.gov/data/global-hourly/access/2023/{sid}.csv"
     try:
-        r = requests.get(url, headers=UA, timeout=30)
+        resp = net.get(net.station_year_url(sid, YEAR), timeout=30)
     except requests.RequestException as exc:
         log(f"    {sid} {name}: request error {exc}")
         return None
-    if r.status_code != 200:
-        log(f"    {sid} {name}: HTTP {r.status_code}")
+    if resp.status_code != 200:
+        log(f"    {sid} {name}: HTTP {resp.status_code}")
         return None
-    rows = list(csvmod.DictReader(io.StringIO(r.text)))
+    rows = net.parse_csv_rows(resp.text)
     if not rows:
         log(f"    {sid} {name}: empty")
         return None
     n = len(rows)
-    tmp = sum(1 for x in rows if temp_ok(x.get("TMP", "")))
-    dew = sum(1 for x in rows if temp_ok(x.get("DEW", "")))
-    spring = [x for x in rows if x.get("DATE", "")[5:7] in ("04", "05")]
-    frost = sum(1 for x in spring
-                if temp_ok(x.get("TMP", "")) and int(x["TMP"].split(",")[0]) <= 0)
-    size_mb = len(r.content) / 1e6
+    spring = month_rows(rows, SPRING_MONTHS)
+    frost = sum(1 for t in temperatures(spring) if t <= FROST_C)
+    size_mb = len(resp.content) / 1e6
     log(f"    {sid} {name:22s} OK rows={n:5d} ({size_mb:.1f}MB) "
-        f"TMP={100*tmp/n:3.0f}% DEW={100*dew/n:3.0f}% "
+        f"TMP={100*coverage(rows, 'TMP')/n:3.0f}% "
+        f"DEW={100*coverage(rows, 'DEW')/n:3.0f}% "
         f"springFrost={100*frost/max(len(spring),1):4.1f}%")
     return sid
 
@@ -68,15 +58,8 @@ def main() -> None:
     args = ap.parse_args()
 
     log("downloading isd-history.csv (a few MB) ...")
-    r = requests.get("https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv",
-                     headers=UA, timeout=120)
-    r.raise_for_status()
-    log(f"history downloaded ({len(r.content)/1e6:.1f}MB), parsing ...")
-    hist = pd.read_csv(io.StringIO(r.text), dtype=str)
-    hist["END"] = pd.to_numeric(hist["END"], errors="coerce")
-    hist["LAT"] = pd.to_numeric(hist["LAT"], errors="coerce")
-    hist["LON"] = pd.to_numeric(hist["LON"], errors="coerce")
-    active = hist[hist["END"] >= 20231201]
+    hist = isd_history.load_isd_history()
+    active = isd_history.active_stations(hist, active_through=20231201)
     log(f"parsed: {len(hist)} stations, {len(active)} active through 2023")
 
     for country, lat_lo, lat_hi, lon_lo, lon_hi in [
@@ -88,7 +71,7 @@ def main() -> None:
                      & active["LON"].between(lon_lo, lon_hi)]
         log(f"{country}: {len(sub)} candidate stations; probing up to {args.limit}")
         found = 0
-        for i, (_, row) in enumerate(sub.iterrows(), start=1):
+        for _, row in sub.iterrows():
             if found >= args.limit:
                 break
             name = str(row["STATION NAME"])[:22]

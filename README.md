@@ -124,6 +124,13 @@ NOAA ISD CSVs      one row per            HistGradientBoosting regressor
    fit on training data only, inside each fold, to avoid leaking the held-out
    period's climate).
 
+Shared definitions live in **`frostlib/`**: ISD field decoding and quality flags
+(`isd`), the NCEI URLs (`net`, `isd_history`), data locations and the raw-file
+naming convention (`paths`), and the frost feature formulas (`physics`). The
+last matters most: `prepare.py` (training rows) and `predict.py` (a served
+forecast) compute `radiative_potential` and `dewpoint_depression_c` from the
+same code, so the served row cannot drift from what the model was fit on.
+
 ### Anti-leakage discipline
 
 - Features use only observations up to the 18:00 LST cutoff; the label window

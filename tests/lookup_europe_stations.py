@@ -5,31 +5,20 @@ search it for UK / France / Poland / Germany stations that were active in 2023.
 Prints candidate ids in the exact form the access URL expects (USAF+WBAN).
 """
 
-import io
+import _common  # noqa: F401  -- puts the repository root on sys.path
 
-import pandas as pd
-import requests
+from frostlib import isd_history
 
-UA = {"User-Agent": "cloud-cover-portfolio/0.1 (research; contact via README)"}
-
-# NOAA ISD station history (fixed dataset of all stations).
-URL = "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv"
 print("fetching isd-history.csv ...")
-r = requests.get(URL, headers=UA, timeout=120)
-r.raise_for_status()
-hist = pd.read_csv(io.StringIO(r.text), dtype=str)
+hist = isd_history.load_isd_history()
 print("columns:", list(hist.columns))
 print("total stations:", len(hist))
 
-# Keep stations active through 2023.
-hist["END"] = pd.to_numeric(hist["END"], errors="coerce")
-active = hist[hist["END"] >= 20231231].copy()
-
-for country in ["UK", "FR", "PO", "GM"]:  # ISD uses FIPS: UK, FR, PO(Poland), GM(Germany)
-    sub = active[active["CTRY"] == country]
+for country in ["UK", "FR", "PL", "GM"]:  # ISD FIPS codes (PL=Poland, GM=Germany)
+    sub = isd_history.active_stations(hist, country=country)
     print(f"\n=== {country}: {len(sub)} active stations (showing a sample) ===")
     show = sub[["USAF", "WBAN", "STATION NAME", "CTRY", "LAT", "LON"]].head(12)
     for _, row in show.iterrows():
-        sid = f"{row['USAF']}{row['WBAN']}"
-        print(f"  {sid}  {str(row['STATION NAME'])[:34]:34s} "
+        print(f"  {isd_history.station_id(row)}  "
+              f"{str(row['STATION NAME'])[:34]:34s} "
               f"lat={row['LAT']} lon={row['LON']}")

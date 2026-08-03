@@ -8,14 +8,13 @@ station with poor DEW coverage is disqualified regardless of anything else.
 Station ids resolved from NOAA isd-history (USAF+WBAN, WBAN=099999 for Europe).
 """
 
-import io
-import csv as csvmod
-
-import pandas as pd
 import requests
+from _common import FROST_C, coverage, month_rows, temperatures
 
-UA = {"User-Agent": "frost-detector/0.1 (research; contact via README)"}
+from frostlib import net
+
 YEARS = [2021, 2022, 2023]
+SPRING_MONTHS = ("04", "05")
 
 # Candidates in real fruit / horticulture regions. Verified to exist via the
 # isd-history lookup; names are the ISD station names.
@@ -31,45 +30,25 @@ CANDIDATES = {
     "UK_manston_kent": "037960099999",
 }
 
-
-def sub(raw: str, idx: int) -> str:
-    parts = raw.split(",") if raw else []
-    return parts[idx] if len(parts) > idx else ""
-
-
-def temp_ok(raw: str) -> bool:
-    return bool(raw) and sub(raw, 0) not in ("+9999", "9999") and sub(raw, 1) not in ("2", "3", "6", "7")
-
-
-def temp_val(raw: str):
-    return int(sub(raw, 0)) / 10.0 if temp_ok(raw) else None
-
-
 for name, sid in CANDIDATES.items():
     total_rows = tmp_ok = dew_ok = 0
-    spring_lows = []
+    spring_lows: list[float] = []
     resolved_years = 0
     for year in YEARS:
-        url = f"https://www.ncei.noaa.gov/data/global-hourly/access/{year}/{sid}.csv"
-        r = requests.get(url, headers=UA, timeout=90)
-        if r.status_code != 200:
+        try:
+            rows = net.fetch_station_year_rows(sid, year, timeout=90)
+        except requests.RequestException:
             continue
         resolved_years += 1
-        rows = list(csvmod.DictReader(io.StringIO(r.text)))
         total_rows += len(rows)
-        tmp_ok += sum(1 for x in rows if temp_ok(x.get("TMP", "")))
-        dew_ok += sum(1 for x in rows if temp_ok(x.get("DEW", "")))
+        tmp_ok += coverage(rows, "TMP")
+        dew_ok += coverage(rows, "DEW")
         # spring-window (Apr-May) daily-ish min temp as a rough frost signal
-        for x in rows:
-            date = x.get("DATE", "")
-            if len(date) >= 7 and date[5:7] in ("04", "05"):
-                v = temp_val(x.get("TMP", ""))
-                if v is not None:
-                    spring_lows.append(v)
+        spring_lows += temperatures(month_rows(rows, SPRING_MONTHS))
     if resolved_years == 0:
         print(f"{name:24s} HTTP 404 (id {sid})")
         continue
-    frost = sum(1 for v in spring_lows if v <= 0) if spring_lows else 0
+    frost = sum(1 for v in spring_lows if v <= FROST_C)
     print(f"{name:24s} yrs={resolved_years} rows={total_rows:6d}  "
           f"TMP={100*tmp_ok/total_rows:3.0f}%  DEW={100*dew_ok/total_rows:3.0f}%  "
           f"spring<=0C={100*frost/max(len(spring_lows),1):4.1f}%  (id {sid})")

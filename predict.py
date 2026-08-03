@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
@@ -27,27 +26,22 @@ import joblib
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
+from frostlib import physics
+from frostlib.paths import MODEL_PATH
 from train import (
     DATA,
     FEATURES,
+    FIXED_MODEL_PARAMS,
     RECOMMENDED_ALARM_C,
     TARGET,
 )
 
-HERE = Path(__file__).resolve().parent
-MODEL_PATH = HERE / "data" / "model.joblib"
-
-# Fixed hyperparameters (a representative point from train.py's search); this
-# script is the deployment artifact, not the tuning experiment.
-MODEL_PARAMS = {
-    "learning_rate": 0.05, "max_iter": 400, "max_leaf_nodes": 31,
-    "min_samples_leaf": 20, "early_stopping": True, "random_state": 42,
-}
-
 
 def fit_and_save() -> None:
     df = pd.read_csv(DATA)
-    model = HistGradientBoostingRegressor(**MODEL_PARAMS)
+    # Fixed hyperparameters (shared with train.py); this script is the
+    # deployment artifact, not the tuning experiment.
+    model = HistGradientBoostingRegressor(**FIXED_MODEL_PARAMS)
     model.fit(df[FEATURES], df[TARGET])
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({"model": model, "features": FEATURES}, MODEL_PATH)
@@ -55,17 +49,21 @@ def fit_and_save() -> None:
 
 
 def _derived(args) -> dict:
-    """Assemble the feature row from CLI inputs, computing the derived ones."""
-    cloud = args.cloud if args.cloud is not None else 4.0
-    wind = args.wind if args.wind is not None else 3.0
+    """Assemble the feature row from CLI inputs, computing the derived ones.
+
+    The derived features come from frostlib.physics -- the same code prepare.py
+    used to build the training rows, so a served row cannot drift from what the
+    model was fit on.
+    """
     return {
         "temp_c": args.temp,
         "dewpoint_c": args.dewpoint,
-        "dewpoint_depression_c": args.temp - args.dewpoint,
+        "dewpoint_depression_c": physics.dewpoint_depression_c(
+            args.temp, args.dewpoint),
         "slp_hpa": args.pressure,
         "wind_ms": args.wind,
         "cloud_oktas": args.cloud,
-        "radiative_potential": (1.0 - cloud / 8.0) / (1.0 + wind),
+        "radiative_potential": physics.radiative_potential(args.cloud, args.wind),
         "temp_change_3h": args.temp_change_3h,
         "temp_change_24h": args.temp_change_24h,
         "slp_tendency_3h": args.slp_tendency_3h,

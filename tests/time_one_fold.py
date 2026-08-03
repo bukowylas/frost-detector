@@ -5,27 +5,21 @@ prints the fold metrics -- so we confirm the code works and can extrapolate the
 full 13-fold run's cost before committing to it (execution-budget discipline).
 """
 
-import sys
-import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import pandas as pd
+import _common  # noqa: F401  -- puts the repository root on sys.path
 
 import train
+from frostlib.progress import Timer
 
-df = pd.read_csv(train.DATA)
-df["year"] = pd.to_datetime(df["date"]).dt.year
+df = train.load_nights()
 held = sorted(df["year"].unique())[-1]
 train_df = df[df["year"] != held]
 test_df = df[df["year"] == held]
 print(f"one LOYO fold: hold out {held}  "
       f"(train {len(train_df)}, test {len(test_df)})", flush=True)
 
-t0 = time.monotonic()
+timer = Timer()
 res = train.evaluate_fold(train_df, test_df, str(held))
-dt = time.monotonic() - t0
+dt = timer.elapsed()
 
 print(f"\nfold done in {dt:.1f}s", flush=True)
 for k, v in res.items():
