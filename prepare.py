@@ -90,7 +90,19 @@ def decode_station(csv_path: Path) -> pd.DataFrame:
     # Shift UTC to Local Standard Time, then drop the tz so the column is naive
     # LST -- keeping a UTC tz-label on LST values is a trap for anything that
     # later tz-converts or compares against a genuinely-UTC series.
-    utc = pd.to_datetime(raw["DATE"], utc=True, errors="coerce")
+    # ISD DATE is a fixed ISO format; specifying it is faster and deterministic
+    # (no per-element guessing) and silences pandas' format-inference warning.
+    # errors="coerce" still turns a malformed value into NaT rather than raising.
+    utc = pd.to_datetime(raw["DATE"], format="%Y-%m-%dT%H:%M:%S",
+                         utc=True, errors="coerce")
+    # ISD's DATE is a rigid ISO format, so a coerced NaT is genuinely malformed
+    # data, not a format variant. Those rows get dropped below; surface the count
+    # rather than let a parsing change silently discard observations -- the
+    # coverage report tallies rejected nights, not dropped rows, so this loss
+    # would otherwise be invisible.
+    n_unparsed = int(utc.isna().sum())
+    if n_unparsed:
+        print(f"  {station}: {n_unparsed} row(s) with an unparseable DATE dropped")
     lst = (utc + pd.to_timedelta(isd.lst_offset(station), unit="h")).dt.tz_localize(None)
     out = pd.DataFrame({"lst": lst})
     out["station"] = station
