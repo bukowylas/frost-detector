@@ -45,11 +45,18 @@ import pandas as pd
 
 from frostlib import isd, paths, physics
 
+# Where this step reads and writes (frostlib.paths owns the defaults).
+RAW_DIR = paths.RAW_DIR
+OUT_DIR = paths.DATA_DIR
+
 # Cutoff / label window in LST.
 CUTOFF_HOUR = 18            # features use observations at/just before this
 LABEL_START_HOUR = 20      # overnight-min window start (same evening)
 LABEL_END_HOUR = 8         # overnight-min window end (next morning)
 LATE_HOUR = 4              # a night must have an obs at/after this (near dawn)
+# How far back from the cutoff the feature window reaches: enough for the 24 h
+# trend lookback plus the tolerance _nearest_at_or_before allows.
+FEATURE_WINDOW_HOURS = 30
 # The 18:00-20:00 gap between them is excluded from both by construction.
 
 # Frost-risk windows as (month, day) ranges, inclusive.
@@ -119,6 +126,73 @@ def _nearest_at_or_before(day_obs: pd.DataFrame, target, tol_minutes=90,
     return row
 
 
+def build_feature_row(obs: pd.DataFrame, cutoff) -> dict | None:
+    """The model's input features for one station-night, or None if unusable.
+
+    THE single feature builder: the training path (``build_nights`` below) and
+    the live path must both call this, so the live service cannot drift into
+    feeding the model a subtly different vector than it was trained on.
+
+    ``obs`` is one station's observations covering (at least) the run-up to
+    ``cutoff``; only the last ``FEATURE_WINDOW_HOURS`` up to the cutoff are used,
+    so passing a wider frame is safe. Nothing here looks past the cutoff -- the
+    label window is the caller's business, which is what makes this reusable
+    live, where the night has not happened yet.
+
+    Returns None when the window has no usable cutoff snapshot (no observation
+    within tolerance, or one lacking temperature or dew point). Missing data is
+    never imputed: the caller records the rejection instead.
+    """
+    # Sorted here, not assumed: "the last observation by 18:00" is a positional
+    # lookup, so an unsorted live payload would silently pick the wrong row. The
+    # sort must be STABLE: ISD sometimes reports two rows at the same timestamp,
+    # and an unstable sort would reorder them, changing which one is "last".
+    window = obs[(obs["lst"] >= cutoff - pd.Timedelta(hours=FEATURE_WINDOW_HOURS))
+                 & (obs["lst"] <= cutoff)].sort_values("lst", kind="stable")
+    at = _nearest_at_or_before(window, cutoff, require_col="temp_c")
+    if at is None or pd.isna(at["dewpoint_c"]):
+        return None
+
+    # Trend lookups require a real value in the column being differenced, so a
+    # valueless partial report doesn't shadow an earlier good reading.
+    lag3 = cutoff - pd.Timedelta(hours=3)
+    lag24 = cutoff - pd.Timedelta(hours=24)
+    at_3h_t = _nearest_at_or_before(window, lag3, require_col="temp_c")
+    at_24h_t = _nearest_at_or_before(window, lag24, require_col="temp_c")
+    at_3h_p = _nearest_at_or_before(window, lag3, require_col="slp_hpa")
+
+    # Radiative-cooling potential, from frostlib.physics so a live caller and
+    # the training rows cannot compute it differently. Its missing-data defaults
+    # feed only this derived term; the raw cloud/wind features stay missing,
+    # which the model handles natively.
+    radiative_potential = physics.radiative_potential(
+        at["cloud_oktas"], at["wind_ms"])
+
+    def trend(col, past_row, now_row=at):
+        if past_row is None or pd.isna(past_row[col]) or pd.isna(now_row[col]):
+            return math.nan
+        return float(now_row[col] - past_row[col])
+
+    return {
+        "month": cutoff.month,
+        "doy": int(cutoff.dayofyear),
+        "lat": at["lat"], "lon": at["lon"], "elev": at["elev"],
+        # cutoff snapshot
+        "temp_c": float(at["temp_c"]),
+        "dewpoint_c": float(at["dewpoint_c"]),
+        "dewpoint_depression_c": physics.dewpoint_depression_c(
+            at["temp_c"], at["dewpoint_c"]),
+        "slp_hpa": float(at["slp_hpa"]) if pd.notna(at["slp_hpa"]) else math.nan,
+        "wind_ms": float(at["wind_ms"]) if pd.notna(at["wind_ms"]) else math.nan,
+        "cloud_oktas": float(at["cloud_oktas"]) if pd.notna(at["cloud_oktas"]) else math.nan,
+        "radiative_potential": float(radiative_potential),
+        # trends (cheap synoptic / advection signal)
+        "temp_change_3h": trend("temp_c", at_3h_t),
+        "temp_change_24h": trend("temp_c", at_24h_t),
+        "slp_tendency_3h": trend("slp_hpa", at_3h_p),
+    }
+
+
 def build_nights(obs: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
     """Collapse hourly observations into one row per (station, frost-risk night).
 
@@ -142,26 +216,11 @@ def build_nights(obs: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
             label_start = day + pd.Timedelta(hours=LABEL_START_HOUR)
             label_end = day + pd.Timedelta(days=1, hours=LABEL_END_HOUR)
 
-            # Features: observation window up to the cutoff (last 30 h, so 24 h
-            # trends are available).
-            window = g[(lst >= cutoff - pd.Timedelta(hours=30)) & (lst <= cutoff)]
-            at = _nearest_at_or_before(window, cutoff, require_col="temp_c")
-            if at is None or pd.isna(at["dewpoint_c"]):
+            # Features: the shared builder, exactly as the live path will call it.
+            features = build_feature_row(g, cutoff)
+            if features is None:
                 rejected["no_evening_snapshot"] += 1
                 continue
-
-            # Trend lookups require a real value in the column being differenced,
-            # so a valueless partial report doesn't shadow an earlier good reading.
-            lag3 = cutoff - pd.Timedelta(hours=3)
-            lag24 = cutoff - pd.Timedelta(hours=24)
-            at_3h_t = _nearest_at_or_before(window, lag3, require_col="temp_c")
-            at_24h_t = _nearest_at_or_before(window, lag24, require_col="temp_c")
-            at_3h_p = _nearest_at_or_before(window, lag3, require_col="slp_hpa")
-
-            # Radiative-cooling potential (shared with predict.py so training and
-            # serving compute the same feature).
-            radiative_potential = physics.radiative_potential(
-                at["cloud_oktas"], at["wind_ms"])
 
             # Label: overnight minimum temperature. The true minimum usually
             # falls near dawn, so a night observed only in the evening would give
@@ -180,41 +239,21 @@ def build_nights(obs: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
                 continue  # too few / no late (near-dawn) obs -> untrustworthy min
             tmin = float(night_temps.min())
 
-            def trend(col, past_row, now_row=at):
-                if past_row is None or pd.isna(past_row[col]) or pd.isna(now_row[col]):
-                    return math.nan
-                return float(now_row[col] - past_row[col])
-
             rows.append({
                 "station": station,
                 "date": day.date().isoformat(),
-                "month": month,
-                "doy": int(day.dayofyear),
-                "lat": at["lat"], "lon": at["lon"], "elev": at["elev"],
-                # 18:00 snapshot
-                "temp_c": float(at["temp_c"]),
-                "dewpoint_c": float(at["dewpoint_c"]),
-                "dewpoint_depression_c": physics.dewpoint_depression_c(
-                    at["temp_c"], at["dewpoint_c"]),
-                "slp_hpa": float(at["slp_hpa"]) if pd.notna(at["slp_hpa"]) else math.nan,
-                "wind_ms": float(at["wind_ms"]) if pd.notna(at["wind_ms"]) else math.nan,
-                "cloud_oktas": float(at["cloud_oktas"]) if pd.notna(at["cloud_oktas"]) else math.nan,
-                "radiative_potential": float(radiative_potential),
-                # trends (cheap synoptic / advection signal)
-                "temp_change_3h": trend("temp_c", at_3h_t),
-                "temp_change_24h": trend("temp_c", at_24h_t),
-                "slp_tendency_3h": trend("slp_hpa", at_3h_p),
-                # label
+                **features,
+                # label (training only -- the live path has no label yet)
                 "tmin_overnight_c": tmin,
             })
     return pd.DataFrame(rows), rejected
 
 
 def main() -> None:
-    csv_paths = paths.raw_station_years()
+    csv_paths = paths.raw_station_years(RAW_DIR)
     if not csv_paths:
         raise FileNotFoundError(
-            f"No isd_*.csv in {paths.RAW_DIR}. Run `python3 fetch_data.py` first."
+            f"No isd_*.csv in {RAW_DIR}. Run `python3 fetch_data.py` first."
         )
     print(f"decoding {len(csv_paths)} station-years ...", flush=True)
     obs = pd.concat([decode_station(p) for p in csv_paths], ignore_index=True)
@@ -233,9 +272,10 @@ def main() -> None:
     if nights.empty:
         raise SystemExit("no usable nights -- see the rejection counts above")
 
-    paths.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    nights.to_csv(paths.NIGHTS_CSV, index=False)
-    print(f"wrote {paths.NIGHTS_CSV}", flush=True)
+    out_csv = OUT_DIR / paths.NIGHTS_NAME
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    nights.to_csv(out_csv, index=False)
+    print(f"wrote {out_csv}", flush=True)
 
     # Quick honest summary.
     frost = (nights["tmin_overnight_c"] <= 0).mean()

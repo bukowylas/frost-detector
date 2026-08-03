@@ -57,7 +57,7 @@ from frostlib import paths
 from frostlib.progress import Timer
 
 DATA = paths.NIGHTS_CSV
-METRICS_JSON = paths.METRICS_JSON
+OUT_DIR = paths.DATA_DIR
 
 FEATURES = [
     "temp_c", "dewpoint_c", "dewpoint_depression_c", "slp_hpa", "wind_ms",
@@ -99,13 +99,14 @@ _timer = Timer(style="clock")
 step = _timer.log
 
 
-def load_nights(path=DATA) -> pd.DataFrame:
+def load_nights(path=None) -> pd.DataFrame:
     """Read nights.csv and add the grouping columns the CV folds hold out.
 
     Shared with the timing/experiment scripts under tests/ so every consumer of
-    the dataset derives ``year`` and ``country`` the same way.
+    the dataset derives ``year`` and ``country`` the same way. ``path`` is read
+    from DATA at call time, so a caller can point the module at another dataset.
     """
-    df = pd.read_csv(path)
+    df = pd.read_csv(DATA if path is None else path)
     df["year"] = pd.to_datetime(df["date"]).dt.year
     df["country"] = df["station"].str.slice(0, 2)  # pl / uk
     return df
@@ -422,9 +423,10 @@ def main() -> None:
         "leave_one_country_out": summarise(loco, "LOCO"),
         "leave_one_country_out_no_geo": summarise(loco_nogeo, "LOCO-nogeo"),
     }
-    paths.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    METRICS_JSON.write_text(_dump_json(summary))
-    step(f"wrote {METRICS_JSON}")
+    metrics_json = OUT_DIR / paths.METRICS_NAME
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    metrics_json.write_text(_dump_json(summary))
+    step(f"wrote {metrics_json}")
     step("done.")
 
 

@@ -16,14 +16,18 @@ RAW_DIR = REPO_ROOT / "data_raw"
 RAW_GLOB = "isd_*.csv"
 
 DATA_DIR = REPO_ROOT / "data"
-NIGHTS_CSV = DATA_DIR / "nights.csv"
-METRICS_JSON = DATA_DIR / "metrics.json"
-MODEL_PATH = DATA_DIR / "model.joblib"
+NIGHTS_NAME = "nights.csv"
+METRICS_NAME = "metrics.json"
+MODEL_NAME = "model.joblib"
+NIGHTS_CSV = DATA_DIR / NIGHTS_NAME
+METRICS_JSON = DATA_DIR / METRICS_NAME
+MODEL_PATH = DATA_DIR / MODEL_NAME
 
 
-def raw_csv_path(station_name: str, station_id: str, year: int) -> Path:
+def raw_csv_path(station_name: str, station_id: str, year: int,
+                 raw_dir: Path = RAW_DIR) -> Path:
     """Where one raw station-year CSV lives."""
-    return RAW_DIR / f"isd_{station_name}_{station_id}_{year}.csv"
+    return raw_dir / f"isd_{station_name}_{station_id}_{year}.csv"
 
 
 def station_name_from_path(csv_path: Path) -> str:

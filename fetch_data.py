@@ -30,8 +30,9 @@ from pathlib import Path
 
 import requests
 
-from frostlib import net
-from frostlib.paths import raw_csv_path
+from frostlib import net, paths
+
+RAW_DIR = paths.RAW_DIR
 
 # Downloads are I/O-bound (waiting on the NCEI server), and these European
 # station-years are large (~9 MB) and slow (~70 s each sequentially), so we
@@ -144,7 +145,7 @@ def main() -> None:
     to_fetch = []
     skipped = 0
     for name, sid, year in jobs:
-        out = raw_csv_path(name, sid, year)
+        out = paths.raw_csv_path(name, sid, year, RAW_DIR)
         if out.exists() and not args.force:
             skipped += 1
         else:
