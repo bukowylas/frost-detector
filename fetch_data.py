@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,6 +60,14 @@ UK_STATIONS = {
     "uk_manchester": "03334099999",
 }
 DEFAULT_STATIONS = {**POLAND_STATIONS, **UK_STATIONS}
+
+# A station name and id both flow, unmodified, into a filesystem path
+# (isd_<name>_<id>_<year>.csv under data_raw/) AND into the fetch URL
+# (<BASE_URL>/<year>/<id>.csv). Constrain them to safe characters so a crafted
+# --stations value (e.g. containing "/" or "..") cannot traverse out of the
+# data directory or repoint the request at another path on the host.
+NAME_RE = re.compile(r"\A[A-Za-z0-9_]+\Z")
+STATION_ID_RE = re.compile(r"\A[0-9]+\Z")
 
 # Multiple years so year-to-year variability (the dominant uncertainty for a
 # weather target) is represented, and leave-one-year-out evaluation has enough
@@ -140,6 +149,16 @@ def main() -> None:
                     "name prefix pl_/uk_ sets the local-standard-time offset."
                 )
             name, sid = spec.split("=", 1)
+            if not NAME_RE.match(name):
+                raise SystemExit(
+                    f"invalid station name {name!r}: only letters, digits and "
+                    "underscore are allowed (it becomes part of a file path)."
+                )
+            if not STATION_ID_RE.match(sid):
+                raise SystemExit(
+                    f"invalid station id {sid!r}: ISD ids are digits only "
+                    "(it becomes part of a file path and the fetch URL)."
+                )
             stations[name] = sid
     else:
         stations = DEFAULT_STATIONS
