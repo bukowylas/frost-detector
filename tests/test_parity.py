@@ -1,31 +1,46 @@
 """Parity gate: the live path must reproduce the trained model.
 
-This is the go/no-go test for the live service. For each serviceable station it
-fetches the live observation window, builds the feature vector via the SAME
-``prepare.build_feature_row`` the model was trained through, and asserts that the
-resulting prediction matches the prediction from the training features stored in
-``nights.csv``. If the live path diverged, the deployed system would not be the
-system whose accuracy was published.
+Go/no-go test for the live service. For each serviceable station and a set of
+stratified nights (coldest, lowest-pressure, windiest -- chosen from the training
+data so the frost case and the cyclonic sub-1000 hPa case are exercised, not just
+convenient clear evenings), it fetches the live window, builds the feature vector
+through the SAME ``prepare.build_feature_row`` the model was trained through, and
+checks it against the training row.
 
-**Not part of the offline unit suite.** It makes real network calls to OGIMET,
-which rate-limits to one query per IP per 20 s, so a run is paced and slow. It is
-excluded from the default collection (see ``pytest.ini`` ``testpaths``) and run
-deliberately:
+What is asserted, and the one deliberate gap -- cloud:
+
+- Every live-observed and derived feature EXCEPT cloud must match the training
+  value (temperature, dew point, dew-point depression, sea-level pressure, wind,
+  the three trends), as must the static geography and calendar fields. These are
+  the fields the live path is meant to reproduce, so they are checked directly
+  and tightly (FEATURE_TOL, ~float noise).
+- ``cloud_oktas`` is NOT sourced live -- no serviceable SYNOP station supplies it
+  in a form matching how NCEI derived the training value. It is a genuine frost
+  driver (clear, calm nights radiate fastest), so this is a real limitation, not
+  a throwaway. The gate does not pretend it away:
+    * it asserts cloud is *missing* live (visible gap, never a silent zero);
+    * it measures what missing cloud costs on this night -- the gap between the
+      forecast the live (cloud-blank) features produce and the forecast the full
+      training features produce -- and reports it, so the cost is quantified;
+    * it checks the live forecast equals the same-night cloud-blanked training
+      forecast (to PRED_TOL_C), confirming that missing cloud is the ONLY thing
+      that differs between live and training -- no other feature has drifted.
+  The honest reading is: the live system reproduces every feature it can, and
+  runs cloud-blank until cloud is either dropped from the model on retrain or
+  supplied from a cloud-cover source (see ``frostlib.live`` module docstring).
+
+**Not part of the offline unit suite.** It makes real, rate-limited network calls
+to OGIMET (one query per IP per 20 s), so it is excluded from the default
+collection (``pytest.ini`` ``testpaths = tests/unit``) and run deliberately:
 
     python3 -m pytest tests/test_parity.py -v -o addopts=""
 
-What it checks, and why the check is on the *prediction*:
-
-- The SYNOP core (temperature, dew point, sea-level pressure, wind) decodes to
-  the training values exactly -- verified at the feature level.
-- Cloud is intentionally NOT reproduced from SYNOP (SYNOP's total-cloud digit
-  and NCEI's ISD oktas do not decode 1:1); it is left missing, as the model
-  handles natively. This shifts the derived ``radiative_potential`` slightly, so
-  the honest question is whether the *forecast* still matches -- it does, to well
-  within the model's own ~1.8 C error. The assertion is therefore on the
-  predicted minimum temperature, the quantity that actually reaches a grower.
+Fail-closed: a run in which no case actually executed its assertions (all
+skipped, e.g. rate-limited) fails ``test_parity_coverage`` -- a gate that can
+pass having checked nothing is not a gate.
 """
 
+import math
 import time
 
 import joblib
@@ -33,66 +48,137 @@ import pandas as pd
 import pytest
 
 import prepare
-from frostlib import live, paths
+from frostlib import live, paths, physics
 
-# In-window dates present in the training set. Kept small: each fetch costs a
-# 20 s OGIMET cooldown, so N stations x M dates x 20 s is the run time.
-DATES = ["2023-04-10", "2023-04-15"]
-
-# The live forecast must match the trained-feature forecast to well within the
-# model's own mean absolute error (~1.8 C); the only feature that differs is the
-# cloud-derived term, whose effect on the prediction is a fraction of a degree.
-PRED_TOL_C = 0.5
+# Features that must reproduce exactly from live observations (cloud excepted).
+EXACT_FEATURES = [
+    "temp_c", "dewpoint_c", "dewpoint_depression_c", "slp_hpa", "wind_ms",
+    "temp_change_3h", "temp_change_24h", "slp_tendency_3h",
+    "lat", "lon", "elev", "month", "doy",
+]
+FEATURE_TOL = 0.05   # generous vs float noise, far tighter than any real error
+PRED_TOL_C = 0.01    # live vs same-night cloud-blanked training forecast
 
 _OGIMET_COOLDOWN_S = 21
+_executed = {"count": 0}  # cases that actually ran their assertions (fail-closed)
 
 
-def _load_model():
-    if not paths.MODEL_PATH.exists():
-        pytest.skip("no model artifact (run `python3 predict.py --fit`)")
+def _load():
+    if not paths.MODEL_PATH.exists() or not paths.NIGHTS_CSV.exists():
+        pytest.skip("model artifact or nights.csv missing")
     bundle = joblib.load(paths.MODEL_PATH)
-    return bundle["model"], bundle["features"]
+    return bundle["model"], bundle["features"], pd.read_csv(paths.NIGHTS_CSV)
 
 
-def _training_nights():
+def _extreme_date(g, col, how):
+    """The date of the row with the min/max value in ``col`` for group ``g``, or
+    None when the column is entirely NaN for this station (e.g. Manchester never
+    reported SLP -- ``idxmin`` on an all-NaN column raises, so this is guarded)."""
+    valid = g[g[col].notna()]
+    if valid.empty:
+        return None
+    idx = valid[col].idxmin() if how == "min" else valid[col].idxmax()
+    return g.loc[idx, "date"]
+
+
+def _stratified_cases():
+    """One test case per (station, purposeful night): the coldest, the lowest-SLP
+    and the windiest night per serviceable station -- chosen from the training
+    data so the gate exercises frost and cyclonic regimes, not just clear ones.
+    A stratifier whose column is all-NaN for a station is skipped for it, not an
+    error (see ``_extreme_date``)."""
     if not paths.NIGHTS_CSV.exists():
-        pytest.skip("no nights.csv (run the prepare step)")
-    return pd.read_csv(paths.NIGHTS_CSV)
+        return []
+    nights = pd.read_csv(paths.NIGHTS_CSV)
+    cases = []
+    for st in live.PROVIDER:
+        g = nights[nights.station == st]
+        if g.empty:
+            continue
+        picks = {
+            _extreme_date(g, "tmin_overnight_c", "min"),   # coldest (frost)
+            _extreme_date(g, "slp_hpa", "min"),            # cyclonic sub-1000
+            _extreme_date(g, "wind_ms", "max"),            # windiest
+        }
+        picks.discard(None)
+        cases.extend((st, d) for d in sorted(picks))
+    return cases
 
 
-# One (station, date) case per serviceable station x date.
-CASES = [(s, d) for s in live.PROVIDER for d in DATES]
+CASES = _stratified_cases()
+
+
+@pytest.fixture(autouse=True)
+def _pace_ogimet():
+    """Sleep AFTER every case (pass or fail) so a failing assertion never removes
+    the pacing and cascades the rest into rate-limit skips."""
+    yield
+    time.sleep(_OGIMET_COOLDOWN_S)
 
 
 @pytest.mark.parametrize("station,date", CASES)
-def test_live_prediction_matches_training(station, date):
-    model, feat_names = _load_model()
-    nights = _training_nights()
-
+def test_live_matches_training(station, date):
+    model, feat_names, nights = _load()
     row = nights[(nights.station == station) & (nights.date == date)]
     if row.empty:
         pytest.skip(f"{station} {date} not in training set")
     row = row.iloc[0]
-
     cutoff = pd.Timestamp(date) + pd.Timedelta(hours=prepare.CUTOFF_HOUR)
+
     try:
         obs = live.fetch_window(station, cutoff)
-    except Exception as exc:  # noqa: BLE001 -- provider hiccup: skip, don't fail
-        if "quota" in str(exc).lower() or "429" in str(exc) or "501" in str(exc):
-            pytest.skip(f"provider rate-limited: {exc}")
+    except live.OgimetError as exc:
+        pytest.skip(f"provider declined (rate-limit/error body): {exc}")
+    except Exception as exc:  # noqa: BLE001 -- network unreachable: skip, not fail
         pytest.skip(f"provider unreachable: {exc}")
 
-    features = prepare.build_feature_row(obs, cutoff)
-    assert features is not None, f"live window unusable for {station} {date}"
+    feats = prepare.build_feature_row(obs, cutoff)
+    assert feats is not None, f"{station} {date}: live window unusable"
 
-    live_pred = float(model.predict(pd.DataFrame([features])[feat_names])[0])
-    train_pred = float(model.predict(pd.DataFrame([row.to_dict()])[feat_names])[0])
+    # Per-feature exact equality (cloud excepted).
+    for f in EXACT_FEATURES:
+        live_v, train_v = feats[f], float(row[f])
+        assert not (pd.isna(live_v) ^ pd.isna(train_v)), (
+            f"{station} {date}: {f} missingness differs "
+            f"(live={live_v}, train={train_v})")
+        if not pd.isna(live_v):
+            assert abs(live_v - train_v) <= FEATURE_TOL, (
+                f"{station} {date}: {f} live={live_v} vs train={train_v}")
 
-    assert abs(live_pred - train_pred) <= PRED_TOL_C, (
-        f"{station} {date}: live forecast {live_pred:.2f} C diverges from "
-        f"training-feature forecast {train_pred:.2f} C by "
-        f"{abs(live_pred - train_pred):.2f} C (> {PRED_TOL_C} C)"
-    )
+    # Cloud is not sourced live -> must be missing, not silently zero.
+    assert pd.isna(feats["cloud_oktas"]), (
+        f"{station} {date}: cloud_oktas should be missing live, got "
+        f"{feats['cloud_oktas']}")
 
-    # Be a polite OGIMET client: pace requests to its 1-per-20s limit.
-    time.sleep(_OGIMET_COOLDOWN_S)
+    # The same training night AS IF cloud had been missing -- exactly what
+    # build_feature_row computes when cloud is absent. This isolates the cloud gap
+    # from every other feature, so the prediction check below confirms cloud is
+    # the ONLY difference between the live and training feature vectors.
+    blank = row.to_dict()
+    blank["cloud_oktas"] = math.nan
+    blank["radiative_potential"] = physics.radiative_potential(math.nan, row["wind_ms"])
+    assert abs(feats["radiative_potential"] - blank["radiative_potential"]) <= FEATURE_TOL
+
+    live_pred = float(model.predict(pd.DataFrame([feats])[feat_names])[0])
+    blank_pred = float(model.predict(pd.DataFrame([blank])[feat_names])[0])
+    full_pred = float(model.predict(pd.DataFrame([row.to_dict()])[feat_names])[0])
+
+    assert abs(live_pred - blank_pred) <= PRED_TOL_C, (
+        f"{station} {date}: live forecast {live_pred:.3f} != same-night "
+        f"cloud-blanked training forecast {blank_pred:.3f} -- a feature other "
+        f"than cloud has drifted")
+
+    # The quantified cloud limitation: what running cloud-blank costs on this
+    # night (informational, not an assertion) -- reported, never hidden.
+    print(f"  {station} {date}: forecast {live_pred:.2f} C; "
+          f"running cloud-blank costs {abs(blank_pred - full_pred):.3f} C here")
+    _executed["count"] += 1
+
+
+def test_parity_coverage():
+    """Fail-closed: a run where no case actually asserted is not a passing gate."""
+    if not CASES:
+        pytest.skip("no cases (nights.csv missing)")
+    assert _executed["count"] > 0, (
+        "no parity case executed its assertions -- all skipped (provider "
+        "rate-limited/unreachable?). A gate that checks nothing does not pass.")
