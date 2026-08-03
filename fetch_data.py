@@ -31,17 +31,14 @@ from pathlib import Path
 
 import requests
 
+from frostlib import net, paths
+
+RAW_DIR = paths.RAW_DIR
+
 # Downloads are I/O-bound (waiting on the NCEI server), and these European
 # station-years are large (~9 MB) and slow (~70 s each sequentially), so we
 # fetch several at once. Kept modest to be a polite client to a public service.
 MAX_WORKERS = 6
-
-HERE = Path(__file__).resolve().parent
-RAW_DIR = HERE / "data_raw"
-
-BASE_URL = "https://www.ncei.noaa.gov/data/global-hourly/access"
-USER_AGENT = "frost-detector/0.1 (research/portfolio; contact via README)"
-TIMEOUT_SECONDS = 120.0
 
 # Confirmed stations (name -> ISD id). Ids resolved from NOAA's isd-history file
 # and verified for TMP+DEW coverage. Poland is primary (frost signal + the
@@ -98,8 +95,7 @@ def fetch_station_year(
     or truncated download can never leave a partial CSV on disk for the prepare
     step to silently consume.
     """
-    url = f"{BASE_URL}/{year}/{station_id}.csv"
-    resp = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT_SECONDS)
+    resp = net.get(net.station_year_url(station_id, year), session=session)
     resp.raise_for_status()
 
     text = resp.text
@@ -168,7 +164,7 @@ def main() -> None:
     to_fetch = []
     skipped = 0
     for name, sid, year in jobs:
-        out = RAW_DIR / f"isd_{name}_{sid}_{year}.csv"
+        out = paths.raw_csv_path(name, sid, year, RAW_DIR)
         if out.exists() and not args.force:
             skipped += 1
         else:

@@ -169,9 +169,9 @@ class TestMainCli:
 
 class TestModelParams:
     def test_early_stopping_and_seed_are_pinned(self):
-        assert predict.MODEL_PARAMS["early_stopping"] is True
-        assert predict.MODEL_PARAMS["random_state"] == train.RANDOM_STATE
+        assert train.FIXED_MODEL_PARAMS["early_stopping"] is True
+        assert train.FIXED_MODEL_PARAMS["random_state"] == train.RANDOM_STATE
 
     def test_hyperparameters_are_within_the_searched_ranges(self):
-        assert 0.0 < predict.MODEL_PARAMS["learning_rate"] <= 0.1
-        assert predict.MODEL_PARAMS["max_iter"] >= 100
+        assert 0.0 < train.FIXED_MODEL_PARAMS["learning_rate"] <= 0.1
+        assert train.FIXED_MODEL_PARAMS["max_iter"] >= 100

@@ -14,35 +14,35 @@ Usage:
 
 import argparse
 import os
-import sys
-import time
-from pathlib import Path
+
+import _common  # noqa: F401  -- puts the repository root on sys.path
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
-import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 
-import train  # reuse TARGET, FAO baseline, DATA
+import train  # reuse TARGET, FAO baseline, the nights loader
+from frostlib import physics
+from frostlib.progress import Timer
 
 BASE = list(train.FEATURES)
 
 
 def add_radiative_proxy(df):
     df = df.copy()
-    clear = 1 - df["cloud_oktas"].fillna(4) / 8.0        # 1=clear, 0=overcast
+    clear = physics.clear_sky_fraction_col(df["cloud_oktas"])
     df["radiative_proxy"] = df["dewpoint_depression_c"] * clear
-    df["calm_flag"] = (df["wind_ms"].fillna(3) < 2).astype(float)
+    calm = df["wind_ms"].fillna(physics.DEFAULT_WIND_MS) < train.CALM_WIND_MS
+    df["calm_flag"] = calm.astype(float)
     return df, ["radiative_proxy", "calm_flag"]
 
 
 def add_radiative_potential(df):
     df = df.copy()
-    clear = 1 - df["cloud_oktas"].fillna(4) / 8.0
-    df["radiative_potential"] = clear / (1 + df["wind_ms"].fillna(3))
+    df["radiative_potential"] = physics.radiative_potential_col(
+        df["cloud_oktas"], df["wind_ms"])
     return df, ["radiative_potential"]
 
 
@@ -78,10 +78,7 @@ DROP_FEATURES = {"lon", "slp_tendency_3h"}
 def quick_model():
     # Fixed reasonable params (skip the search -- we compare features, not tuning,
     # and want speed + comparability).
-    return HistGradientBoostingRegressor(
-        learning_rate=0.05, max_iter=400, max_leaf_nodes=31,
-        min_samples_leaf=20, early_stopping=True, random_state=train.RANDOM_STATE,
-    )
+    return HistGradientBoostingRegressor(**train.FIXED_MODEL_PARAMS)
 
 
 def score(df, features, held_years):
@@ -103,12 +100,11 @@ def main():
     ap.add_argument("--folds", type=int, default=1)
     args = ap.parse_args()
 
-    df0 = pd.read_csv(train.DATA)
-    df0["year"] = pd.to_datetime(df0["date"]).dt.year
+    df0 = train.load_nights()
     years = sorted(df0["year"].unique())[-args.folds:]
     print(f"scoring on held-out years {years} ({len(df0)} nights)\n", flush=True)
 
-    t0 = time.monotonic()
+    timer = Timer()
     rows = []
     for name, fn in EXPERIMENTS.items():
         df, extra = fn(df0)
@@ -120,7 +116,7 @@ def main():
         rows.append((name, mae, fao, mae - fao, len(feats)))
         print(f"  {name:22s} MAE {mae:.3f}  (FAO {fao:.3f}, "
               f"model-FAO {mae-fao:+.3f})  [{len(feats)} feats]  "
-              f"[{time.monotonic()-t0:.0f}s]", flush=True)
+              f"[{timer.elapsed():.0f}s]", flush=True)
 
     print("\nranked by MAE (lower is better):", flush=True)
     for name, mae, fao, diff, nf in sorted(rows, key=lambda r: r[1]):

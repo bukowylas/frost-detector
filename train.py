@@ -45,7 +45,6 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import json
 import math
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -54,9 +53,11 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import RandomizedSearchCV
 
-HERE = Path(__file__).resolve().parent
-DATA = HERE / "data" / "nights.csv"
-OUT_DIR = HERE / "data"
+from frostlib import paths
+from frostlib.progress import Timer
+
+DATA = paths.NIGHTS_CSV
+OUT_DIR = paths.DATA_DIR
 
 FEATURES = [
     "temp_c", "dewpoint_c", "dewpoint_depression_c", "slp_hpa", "wind_ms",
@@ -81,16 +82,34 @@ RECOMMENDED_ALARM_C = 1.5
 CALM_WIND_MS = 2.0
 RANDOM_STATE = 42
 
+# A representative point from the search below, for the places that want ONE
+# fixed comparable model instead of a per-fold search: predict.py's deployment
+# artifact and tests/experiments.py's feature bench.
+FIXED_MODEL_PARAMS = {
+    "learning_rate": 0.05, "max_iter": 400, "max_leaf_nodes": 31,
+    "min_samples_leaf": 20, "early_stopping": True,
+    "random_state": RANDOM_STATE,
+}
+
 assert RECOMMENDED_ALARM_C in ALARM_THRESHOLDS_C, (
     "RECOMMENDED_ALARM_C must be one of ALARM_THRESHOLDS_C"
 )
 
-_t0 = time.monotonic()
+_timer = Timer(style="clock")
+step = _timer.log
 
 
-def step(msg: str) -> None:
-    mins, secs = divmod(time.monotonic() - _t0, 60)
-    print(f"[{int(mins):02d}:{secs:04.1f}] {msg}", flush=True)
+def load_nights(path=None) -> pd.DataFrame:
+    """Read nights.csv and add the grouping columns the CV folds hold out.
+
+    Shared with the timing/experiment scripts under tests/ so every consumer of
+    the dataset derives ``year`` and ``country`` the same way. ``path`` is read
+    from DATA at call time, so a caller can point the module at another dataset.
+    """
+    df = pd.read_csv(DATA if path is None else path)
+    df["year"] = pd.to_datetime(df["date"]).dt.year
+    df["country"] = df["station"].str.slice(0, 2)  # pl / uk
+    return df
 
 
 def rmse(y_true, y_pred) -> float:
@@ -377,9 +396,7 @@ def summarise(res: pd.DataFrame, name: str) -> dict:
 
 def main() -> None:
     step("loading nights.csv ...")
-    df = pd.read_csv(DATA)
-    df["year"] = pd.to_datetime(df["date"]).dt.year
-    df["country"] = df["station"].str.slice(0, 2)  # pl / uk
+    df = load_nights()
     step(f"loaded {len(df)} nights, {df['station'].nunique()} stations, "
          f"years {sorted(df['year'].unique())}")
 
@@ -406,8 +423,10 @@ def main() -> None:
         "leave_one_country_out": summarise(loco, "LOCO"),
         "leave_one_country_out_no_geo": summarise(loco_nogeo, "LOCO-nogeo"),
     }
-    (OUT_DIR / "metrics.json").write_text(_dump_json(summary))
-    step(f"wrote {OUT_DIR / 'metrics.json'}")
+    metrics_json = OUT_DIR / paths.METRICS_NAME
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    metrics_json.write_text(_dump_json(summary))
+    step(f"wrote {metrics_json}")
     step("done.")
 
 

@@ -12,20 +12,21 @@ physically plausible?
 
 import csv as csvmod
 from collections import Counter
-from pathlib import Path
 
-RAW = Path.home() / "data" / "frost-detector" / "raw"
+import _common  # noqa: F401  -- puts the repository root on sys.path
 
-for field, sentinel in [("TMP", "+9999"), ("DEW", "+9999")]:
+from frostlib import isd, paths
+
+for field in ("TMP", "DEW"):
+    sentinel = isd.MISSING_TEMP
     flag_counts = Counter()
     flag9_sentinel = 0
     flag9_realvalue = 0
     flag9_real_examples = []
     total = 0
-    for path in sorted(RAW.glob("isd_*.csv")):
+    for path in paths.raw_station_years():
         for row in csvmod.DictReader(path.open()):
-            raw = row.get(field, "")
-            parts = raw.split(",") if raw else []
+            parts = isd.packed(row.get(field, ""))
             if len(parts) < 2:
                 continue
             total += 1

@@ -11,10 +11,9 @@ import math
 
 import pandas as pd
 import pytest
+from test_prepare_pipeline import good_night, obs_frame
 
 import prepare
-
-from test_prepare_pipeline import good_night, obs_frame
 
 CUTOFF = pd.Timestamp("2021-04-01 18:00")
 

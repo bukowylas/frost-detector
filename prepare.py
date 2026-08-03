@@ -43,12 +43,11 @@ from pathlib import Path
 
 import pandas as pd
 
-HERE = Path(__file__).resolve().parent
-RAW_DIR = HERE / "data_raw"
-OUT_DIR = HERE / "data"
+from frostlib import isd, paths, physics
 
-# Fixed Local Standard Time offset (hours from UTC) per station-name prefix.
-LST_OFFSET_HOURS = {"pl_": 1, "uk_": 0}
+# Where this step reads and writes (frostlib.paths owns the defaults).
+RAW_DIR = paths.RAW_DIR
+OUT_DIR = paths.DATA_DIR
 
 # Cutoff / label window in LST.
 CUTOFF_HOUR = 18            # features use observations at/just before this
@@ -62,74 +61,6 @@ FEATURE_WINDOW_HOURS = 30
 
 # Frost-risk windows as (month, day) ranges, inclusive.
 RISK_WINDOWS = [((3, 1), (5, 31)), ((9, 15), (11, 15))]
-
-# --- ISD packed-field decoding ----------------------------------------------
-# Reject suspect (2, 6) and erroneous (3, 7) quality flags. Flag '9' (likely
-# "QC not applied") is not listed, but this admits no unchecked data: in this
-# dataset every flag-'9' temperature/dew-point row also carries the missing
-# sentinel (+9999), so the sentinel check drops it regardless. (tests/check_flag9.py
-# checks this holds for the current stations.)
-_BAD_QUALITY_FLAGS = {"2", "6", "3", "7"}
-
-
-def _packed(value: str) -> list[str]:
-    return value.split(",") if isinstance(value, str) and value else []
-
-
-def _scaled_num(raw, sentinel, scale, value_idx=0, flag_idx=1) -> float:
-    """Decode a packed ISD numeric sub-field to a real value, or NaN."""
-    parts = _packed(raw)
-    if len(parts) <= value_idx:
-        return math.nan
-    token = parts[value_idx]
-    if token == sentinel:
-        return math.nan
-    if len(parts) > flag_idx and parts[flag_idx] in _BAD_QUALITY_FLAGS:
-        return math.nan
-    try:
-        return int(token) / scale
-    except ValueError:
-        return math.nan
-
-
-def _temp_c(raw) -> float:
-    return _scaled_num(raw, "+9999", 10.0)
-
-
-def _slp_hpa(raw) -> float:
-    return _scaled_num(raw, "99999", 10.0)
-
-
-def _wind_speed_ms(raw) -> float:
-    return _scaled_num(raw, "9999", 10.0, value_idx=3, flag_idx=4)
-
-
-def _cloud_oktas(raw) -> float:
-    """GA1 lowest-layer coverage in oktas (0-8), or NaN. Clear sky (low oktas)
-    favours radiative cooling, so cloud cover is a frost signal."""
-    parts = _packed(raw)
-    if not parts:
-        return math.nan
-    if len(parts) > 1 and parts[1] in _BAD_QUALITY_FLAGS:
-        return math.nan
-    try:
-        code = int(parts[0])
-    except ValueError:
-        return math.nan
-    return float(code) if 0 <= code <= 8 else math.nan
-
-
-def _station_name(csv_path: Path) -> str:
-    # isd_<name>_<id>_<year>.csv -> <name>. removeprefix (not replace) so an
-    # "isd_" substring elsewhere in the name can't be mangled.
-    return csv_path.stem.removeprefix("isd_").rsplit("_", 2)[0]
-
-
-def _lst_offset(station: str) -> int:
-    for prefix, off in LST_OFFSET_HOURS.items():
-        if station.startswith(prefix):
-            return off
-    raise ValueError(f"no LST offset known for station {station!r}")
 
 
 def _in_risk_window(month: int, day: int) -> bool:
@@ -152,7 +83,7 @@ def decode_station(csv_path: Path) -> pd.DataFrame:
     for col in wanted:
         if col not in raw.columns:
             raw[col] = pd.NA
-    station = _station_name(csv_path)
+    station = paths.station_name_from_path(csv_path)
     # Start the frame from a length-carrying column; assigning a scalar to a
     # still-empty DataFrame would create a zero-length column and silently drop
     # every row (the station column would be empty, breaking the later groupby).
@@ -160,17 +91,17 @@ def decode_station(csv_path: Path) -> pd.DataFrame:
     # LST -- keeping a UTC tz-label on LST values is a trap for anything that
     # later tz-converts or compares against a genuinely-UTC series.
     utc = pd.to_datetime(raw["DATE"], utc=True, errors="coerce")
-    lst = (utc + pd.to_timedelta(_lst_offset(station), unit="h")).dt.tz_localize(None)
+    lst = (utc + pd.to_timedelta(isd.lst_offset(station), unit="h")).dt.tz_localize(None)
     out = pd.DataFrame({"lst": lst})
     out["station"] = station
     out["lat"] = pd.to_numeric(raw["LATITUDE"], errors="coerce")
     out["lon"] = pd.to_numeric(raw["LONGITUDE"], errors="coerce")
     out["elev"] = pd.to_numeric(raw["ELEVATION"], errors="coerce")
-    out["temp_c"] = raw["TMP"].map(_temp_c)
-    out["dewpoint_c"] = raw["DEW"].map(_temp_c)
-    out["slp_hpa"] = raw["SLP"].map(_slp_hpa)
-    out["wind_ms"] = raw["WND"].map(_wind_speed_ms)
-    out["cloud_oktas"] = raw["GA1"].map(_cloud_oktas)
+    out["temp_c"] = raw["TMP"].map(isd.temp_c)
+    out["dewpoint_c"] = raw["DEW"].map(isd.temp_c)
+    out["slp_hpa"] = raw["SLP"].map(isd.slp_hpa)
+    out["wind_ms"] = raw["WND"].map(isd.wind_speed_ms)
+    out["cloud_oktas"] = raw["GA1"].map(isd.cloud_oktas)
     return out.dropna(subset=["lst"])
 
 
@@ -230,14 +161,12 @@ def build_feature_row(obs: pd.DataFrame, cutoff) -> dict | None:
     at_24h_t = _nearest_at_or_before(window, lag24, require_col="temp_c")
     at_3h_p = _nearest_at_or_before(window, lag3, require_col="slp_hpa")
 
-    # Radiative-cooling potential: clear + calm favours strong nocturnal
-    # radiative cooling (the dominant driver of orchard frost), expressed as one
-    # number = (clear fraction) / (1 + wind). Missing cloud -> mid (4 oktas),
-    # missing wind -> a light 3 m/s. These defaults feed only this derived term;
-    # the raw cloud/wind features stay missing, which the model handles natively.
-    cloud = at["cloud_oktas"] if pd.notna(at["cloud_oktas"]) else 4.0
-    wind = at["wind_ms"] if pd.notna(at["wind_ms"]) else 3.0
-    radiative_potential = (1.0 - cloud / 8.0) / (1.0 + wind)
+    # Radiative-cooling potential, from frostlib.physics so a live caller and
+    # the training rows cannot compute it differently. Its missing-data defaults
+    # feed only this derived term; the raw cloud/wind features stay missing,
+    # which the model handles natively.
+    radiative_potential = physics.radiative_potential(
+        at["cloud_oktas"], at["wind_ms"])
 
     def trend(col, past_row, now_row=at):
         if past_row is None or pd.isna(past_row[col]) or pd.isna(now_row[col]):
@@ -251,7 +180,8 @@ def build_feature_row(obs: pd.DataFrame, cutoff) -> dict | None:
         # cutoff snapshot
         "temp_c": float(at["temp_c"]),
         "dewpoint_c": float(at["dewpoint_c"]),
-        "dewpoint_depression_c": float(at["temp_c"] - at["dewpoint_c"]),
+        "dewpoint_depression_c": physics.dewpoint_depression_c(
+            at["temp_c"], at["dewpoint_c"]),
         "slp_hpa": float(at["slp_hpa"]) if pd.notna(at["slp_hpa"]) else math.nan,
         "wind_ms": float(at["wind_ms"]) if pd.notna(at["wind_ms"]) else math.nan,
         "cloud_oktas": float(at["cloud_oktas"]) if pd.notna(at["cloud_oktas"]) else math.nan,
@@ -320,7 +250,7 @@ def build_nights(obs: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
 
 
 def main() -> None:
-    csv_paths = sorted(RAW_DIR.glob("isd_*.csv"))
+    csv_paths = paths.raw_station_years(RAW_DIR)
     if not csv_paths:
         raise FileNotFoundError(
             f"No isd_*.csv in {RAW_DIR}. Run `python3 fetch_data.py` first."
@@ -342,9 +272,10 @@ def main() -> None:
     if nights.empty:
         raise SystemExit("no usable nights -- see the rejection counts above")
 
+    out_csv = OUT_DIR / paths.NIGHTS_NAME
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    nights.to_csv(OUT_DIR / "nights.csv", index=False)
-    print(f"wrote {OUT_DIR / 'nights.csv'}", flush=True)
+    nights.to_csv(out_csv, index=False)
+    print(f"wrote {out_csv}", flush=True)
 
     # Quick honest summary.
     frost = (nights["tmin_overnight_c"] <= 0).mean()

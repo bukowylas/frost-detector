@@ -12,6 +12,7 @@ import pytest
 import requests
 
 import fetch_data
+from frostlib import isd, net
 
 CSV_BODY = '"STATION","DATE","TMP"\n"12105499999","2021-04-01T17:00:00","+0050,1"\n'
 
@@ -55,9 +56,9 @@ class TestFetchStationYear:
         fetch_data.fetch_station_year("12105499999", 2021,
                                       tmp_path / "out.csv", session)
         call = session.calls[0]
-        assert call["url"] == f"{fetch_data.BASE_URL}/2021/12105499999.csv"
-        assert call["headers"]["User-Agent"] == fetch_data.USER_AGENT
-        assert call["timeout"] == fetch_data.TIMEOUT_SECONDS
+        assert call["url"] == f"{net.GLOBAL_HOURLY_BASE}/2021/12105499999.csv"
+        assert call["headers"]["User-Agent"] == net.USER_AGENT
+        assert call["timeout"] == net.TIMEOUT_SECONDS
 
     def test_accepts_an_unquoted_station_header(self, tmp_path):
         out = tmp_path / "out.csv"
@@ -123,9 +124,8 @@ class TestStationConfiguration:
             **fetch_data.POLAND_STATIONS, **fetch_data.UK_STATIONS}
 
     def test_every_default_name_carries_an_lst_prefix(self):
-        import prepare
         for name in fetch_data.DEFAULT_STATIONS:
-            assert prepare._lst_offset(name) in (0, 1)
+            assert isd.lst_offset(name) in (0, 1)
 
     def test_station_ids_are_unique(self):
         ids = list(fetch_data.DEFAULT_STATIONS.values())
