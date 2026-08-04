@@ -61,6 +61,16 @@ def main() -> None:
         logging.info("notified %d subscriber(s); retried %d pending",
                      len(sent), len(resent))
 
+    # Health: surface failed sends and station skips, and exit non-zero when the
+    # night was not clean -- a cron that always exits 0 is a cron nobody watches.
+    health = notify.notify_health(session, date)
+    if health["healthy"]:
+        logging.info("health OK for %s: %s", date, health["send_status"])
+    else:
+        logging.error("UNHEALTHY %s: status=%s skips=%s",
+                      date, health["send_status"], health["skips"])
+        raise SystemExit(1)
+
 
 if __name__ == "__main__":
     main()

@@ -22,7 +22,7 @@ Each send is wrapped, so one dead number never aborts the batch.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError
 
@@ -35,6 +35,10 @@ from service.sms import (
 log = logging.getLogger("frost.notify")
 
 MAX_SEND_ATTEMPTS = 3
+# A frost warning has a shelf life of hours; after this window a pending claim is
+# stale (the night is long past) and must never be sent -- a stale warning is
+# actively misleading, worse than a drop. Expired rows stop counting as in-flight.
+RETRY_WINDOW_DAYS = 1
 
 
 def _as_date(date):
@@ -47,6 +51,13 @@ def _should_notify(sub: Subscriber, forecast: Forecast | None) -> bool:
 
     nightly: always (including a 'no forecast' heartbeat when the station skipped).
     frost:   only when a forecast exists and crosses the subscriber's threshold.
+
+    Deliberate choice: a frost-mode subscriber gets NOTHING on a skipped night.
+    They opted into silence-unless-frost, so a skip stays silent for them -- unlike
+    a nightly subscriber, for whom silence would be the very ambiguity the
+    heartbeat removes. (If skips ever become common enough that a frost subscriber
+    should hear "no data tonight", revisit this -- it is a decision, not an
+    oversight.)
     """
     if sub.mode == "nightly":
         return True
@@ -137,17 +148,37 @@ def notify_for_date(session, date, sender=None, typical_error_c=None):
     return sent
 
 
-def retry_pending(session, sender=None, typical_error_c=None):
-    """Re-attempt pending claims that have not exhausted their attempts.
+def _expire_stale(session, today):
+    """Mark pending claims older than the retry window 'expired', so a long-past
+    night can never be re-sent and stops counting as in-flight."""
+    horizon = today - timedelta(days=RETRY_WINDOW_DAYS)
+    stale = (session.query(SentNotification)
+             .filter(SentNotification.status == "pending",
+                     SentNotification.forecast_date < horizon).all())
+    for claim in stale:
+        claim.status = "expired"
+    if stale:
+        session.commit()
+    return len(stale)
 
-    Picks up rows a crash left pending, or earlier failures, and re-sends -- the
-    at-least-once guarantee. Returns (phone, message) re-sent.
+
+def retry_pending(session, sender=None, typical_error_c=None, today=None):
+    """Re-attempt recent pending claims that have not exhausted their attempts.
+
+    Bounded to the retry window: a claim for a night older than RETRY_WINDOW_DAYS
+    is expired, never sent -- so a claim left pending months ago cannot text a
+    grower a stale, misleading forecast. Returns (phone, message) re-sent.
     """
     sender = sender or LogSmsSender()
+    today = today or _as_date(datetime.now(timezone.utc))
+    _expire_stale(session, today)
+
+    horizon = today - timedelta(days=RETRY_WINDOW_DAYS)
     resent: list[tuple[str, str]] = []
     pending = (session.query(SentNotification)
                .filter(SentNotification.status == "pending",
-                       SentNotification.attempts < MAX_SEND_ATTEMPTS).all())
+                       SentNotification.attempts < MAX_SEND_ATTEMPTS,
+                       SentNotification.forecast_date >= horizon).all())
     for claim in pending:
         sub = session.get(Subscriber, claim.subscriber_id)
         if sub is None or not (sub.verified and sub.active):
@@ -160,3 +191,21 @@ def retry_pending(session, sender=None, typical_error_c=None):
         if _deliver(session, sender, sub, claim, message):
             resent.append((sub.phone, message))
     return resent
+
+
+def notify_health(session, date):
+    """A one-glance answer to "did the system do its job for ``date``?"
+
+    Returns a dict of send-status counts and the stations that skipped (with
+    reasons). A non-empty ``failed`` or ``skips`` is the alert condition -- the
+    caller (run_nightly) logs it and exits non-zero, so a silent cron becomes a
+    watched one.
+    """
+    d = _as_date(date)
+    counts: dict[str, int] = {}
+    for (status,) in session.query(SentNotification.status).filter_by(forecast_date=d):
+        counts[status] = counts.get(status, 0) + 1
+    skips = [(r.station, r.skip_reason) for r in
+             session.query(StationRun).filter_by(date=d, forecast_stored=False).all()]
+    return {"date": d.isoformat(), "send_status": counts, "skips": skips,
+            "healthy": not counts.get("failed") and not skips}

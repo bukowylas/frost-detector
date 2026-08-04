@@ -140,9 +140,24 @@ class TestDeliveryGuarantees:
         claim = session.query(db.SentNotification).one()
         assert claim.status == "pending" and claim.attempts == 1
 
-        notify.retry_pending(session, sender=flaky)             # retry succeeds
+        # today=DAY so the (fixed test date) claim is within the retry window.
+        notify.retry_pending(session, sender=flaky, today=DAY)   # retry succeeds
         session.refresh(claim)
         assert claim.status == "sent" and flaky.calls == 2
+
+    def test_stale_pending_claim_is_expired_not_resent(self, session):
+        # A claim left pending for an old night must never be re-sent -- a stale
+        # frost warning is actively misleading.
+        _forecast(session, tmin=-1.0)
+        _sub(session, "+44700900013", mode="nightly")
+        session.add(db.SentNotification(subscriber_id=1, forecast_date=DAY,
+                                        status="pending", attempts=1))
+        session.commit()
+        sender = LogSmsSender()
+        # "today" is far after DAY -> the claim is outside the retry window.
+        notify.retry_pending(session, sender=sender, today=dt.date(2026, 4, 15))
+        assert sender.sent == []
+        assert session.query(db.SentNotification).one().status == "expired"
 
     def test_send_failure_does_not_abort_the_batch(self, session):
         _forecast(session, tmin=-1.0)
@@ -159,3 +174,20 @@ class TestDeliveryGuarantees:
         notify.notify_for_date(session, DAY, sender=OneBadNumber())
         statuses = {n.status for n in session.query(db.SentNotification).all()}
         assert "sent" in statuses            # the good number was delivered
+
+
+class TestNotifyHealth:
+    def test_healthy_when_all_sent_and_no_skips(self, session):
+        _forecast(session, tmin=-1.0)
+        _run(session)
+        _sub(session, "+44700900020", mode="nightly")
+        notify.notify_for_date(session, DAY)
+        health = notify.notify_health(session, DAY)
+        assert health["healthy"] is True
+        assert health["send_status"].get("sent") == 1
+
+    def test_unhealthy_when_a_station_skipped(self, session):
+        _run(session, stored=False, reason="provider unreachable")
+        health = notify.notify_health(session, DAY)
+        assert health["healthy"] is False
+        assert health["skips"] == [("uk_waddington", "provider unreachable")]

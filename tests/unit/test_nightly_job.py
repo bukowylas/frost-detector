@@ -64,6 +64,15 @@ def fake_fetch(monkeypatch):
 
 IN_SEASON = pd.Timestamp("2021-04-15").date()
 OUT_SEASON = pd.Timestamp("2021-07-15").date()
+# A deterministic "now" 30 min after the 18:00 cutoff, so the live wall-clock
+# guards (cutoff reached, newest obs recent) pass on the synthetic windows.
+NOW_LST = pd.Timestamp("2021-04-15 18:30")
+
+
+def _run(session, **kw):
+    """nightly_job.run with the test's deterministic now_lst, unless overridden."""
+    kw.setdefault("now_lst", NOW_LST)
+    return nightly_job.run(session, **kw)
 
 
 class TestSeasonalGuard:
@@ -74,7 +83,7 @@ class TestSeasonalGuard:
         assert not nightly_job.in_season(OUT_SEASON)
 
     def test_out_of_season_run_stores_nothing(self, session, artifact, fake_fetch):
-        results = nightly_job.run(session, dates=[OUT_SEASON],
+        results = _run(session, dates=[OUT_SEASON],
                                   stations=["uk_waddington"], artifact=artifact)
         assert results == []
         assert session.query(db.Forecast).count() == 0
@@ -82,7 +91,7 @@ class TestSeasonalGuard:
 
 class TestForecastAndStore:
     def test_in_season_run_stores_a_rich_forecast(self, session, artifact, fake_fetch):
-        nightly_job.run(session, dates=[IN_SEASON], stations=["uk_waddington"],
+        _run(session, dates=[IN_SEASON], stations=["uk_waddington"],
                         artifact=artifact, alarm_threshold_c=1.5)
         rows = session.query(db.Forecast).all()
         assert len(rows) == 1
@@ -99,7 +108,7 @@ class TestForecastAndStore:
         # Cold synthetic window -> low prediction -> alarm.
         monkeypatch.setattr(live, "fetch_window",
                             lambda s, c, hours=30: _obs_window(c, temp=-6.0))
-        nightly_job.run(session, dates=[IN_SEASON], stations=["uk_waddington"],
+        _run(session, dates=[IN_SEASON], stations=["uk_waddington"],
                         artifact=artifact, alarm_threshold_c=1.5)
         assert session.query(db.Forecast).one().alarm_fired is True
 
@@ -113,7 +122,7 @@ class TestValidateNeverImpute:
             return pd.DataFrame(columns=["lst", "temp_c", "dewpoint_c", "slp_hpa",
                                          "wind_ms", "cloud_oktas", "lat", "lon", "elev"])
         monkeypatch.setattr(live, "fetch_window", _empty)
-        results = nightly_job.run(session, dates=[IN_SEASON],
+        results = _run(session, dates=[IN_SEASON],
                                   stations=["uk_waddington"], artifact=artifact)
         assert results[0].stored is False
         assert "no usable snapshot" in results[0].reason
@@ -123,7 +132,7 @@ class TestValidateNeverImpute:
         def _boom(station, cutoff, hours=30):
             raise live.OgimetError("rate limited")
         monkeypatch.setattr(live, "fetch_window", _boom)
-        results = nightly_job.run(session, dates=[IN_SEASON],
+        results = _run(session, dates=[IN_SEASON],
                                   stations=["uk_waddington"], artifact=artifact)
         assert results[0].stored is False
         assert "provider declined" in results[0].reason
@@ -132,7 +141,7 @@ class TestValidateNeverImpute:
 class TestIdempotency:
     def test_rerun_updates_in_place_not_duplicate(self, session, artifact, fake_fetch):
         for _ in range(3):
-            nightly_job.run(session, dates=[IN_SEASON], stations=["uk_waddington"],
+            _run(session, dates=[IN_SEASON], stations=["uk_waddington"],
                             artifact=artifact)
         assert session.query(db.Forecast).count() == 1   # one row, not three
         assert session.query(db.StationRun).count() == 1
@@ -140,7 +149,7 @@ class TestIdempotency:
 
 class TestCutoffAndTiming:
     def test_stores_the_snapshot_timestamp(self, session, artifact, fake_fetch):
-        nightly_job.run(session, dates=[IN_SEASON], stations=["uk_waddington"],
+        _run(session, dates=[IN_SEASON], stations=["uk_waddington"],
                         artifact=artifact)
         f = session.query(db.Forecast).one()
         # The snapshot time actually used is recorded, not just the intended cutoff.
@@ -166,9 +175,10 @@ class TestCutoffAndTiming:
                 "wind_ms": 1.0, "cloud_oktas": float("nan"),
                 "lat": 53.17, "lon": -0.52, "elev": 70.0})
         monkeypatch.setattr(live, "fetch_window", _early)
+        # live_clock_check=False isolates the snapshot-tolerance rejection (the
+        # subject here) from the wall-clock guards, which would also reject it.
         res = nightly_job._forecast_one(
-            "uk_waddington", IN_SEASON, artifact, 1.5,
-            now_lst=pd.Timestamp(IN_SEASON) + pd.Timedelta(hours=20))
+            "uk_waddington", IN_SEASON, artifact, 1.5, live_clock_check=False)
         assert res.stored is False
         assert "snapshot" in res.reason
 
@@ -178,7 +188,7 @@ class TestStationRuns:
         monkeypatch.setattr(live, "fetch_window",
                             lambda s, c, hours=30: (_ for _ in ()).throw(
                                 live.OgimetError("rate limited")))
-        nightly_job.run(session, dates=[IN_SEASON], stations=["uk_waddington"],
+        _run(session, dates=[IN_SEASON], stations=["uk_waddington"],
                         artifact=artifact)
         run = session.query(db.StationRun).one()
         assert run.forecast_stored is False and "declined" in run.skip_reason

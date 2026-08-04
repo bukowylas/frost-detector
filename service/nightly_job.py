@@ -20,9 +20,13 @@ Non-negotiables enforced here (each a documented production failure mode):
 - **Frozen artifact, feature names asserted.** The estimator is loaded, never
   refit, and its feature names are asserted against the code's -- a silently
   reordered feature vector is scored by column position and would mis-predict.
-- **Cutoff hour asserted.** The 18:00 cutoff is Local Standard Time; the assertion
-  that the built row's cutoff is hour 18 catches an off-by-one-hour timezone
-  error, which otherwise produces plausible, consistently wrong forecasts.
+- **Clock sanity, and snapshot timing.** Two distinct guards. A mistimed *run*
+  (cron drift) is caught by refusing to forecast before the cutoff and requiring
+  the snapshot within a tight tolerance. A mistimed *clock* (a wrong
+  ``isd.lst_offset``) is caught by comparing the provider's newest observation
+  against wall-clock LST -- an offset error desynchronises the two. The
+  snapshot-hour check is only a backstop for a widened tolerance, not an
+  independent timezone check.
 - **Idempotent.** Re-running for the same date updates that night's row in place
   rather than creating a duplicate (``unique(station, date)``).
 """
@@ -46,8 +50,10 @@ CUTOFF_HOUR_LST = prepare.CUTOFF_HOUR   # 18:00 LST -- one source of truth
 
 # The live path demands the cutoff snapshot be recent, not merely "within 90 min"
 # (the training tolerance). A systematically-early snapshot -- from a mistimed run
-# -- is warm-biased, the under-warning direction. 40 minutes admits the normal
-# hourly SYNOP cadence but rejects a snapshot from the previous hour.
+# -- is warm-biased, the under-warning direction. 40 minutes is set from the
+# measured cadence: the two serviceable stations report a median ~30 min apart
+# near the cutoff, so 40 admits the normal gap while rejecting a snapshot from the
+# previous hour. (Re-measure if the serviceable set changes.)
 LIVE_CUTOFF_TOL_MIN = 40
 
 
@@ -79,27 +85,49 @@ def _now_lst(station):
 
 
 def _forecast_one(station, date, artifact, alarm_threshold_c,
-                  now_lst=None) -> StationResult:
+                  now_lst=None, live_clock_check=True) -> StationResult:
     """Fetch, validate, predict and return a result for one station-night.
 
     Returns a StationResult describing what happened -- stored, or skipped with a
     reason -- without touching the database (the caller persists), so the decision
     logic is testable without a live network or a DB. The ENTIRE body is guarded:
     a single station's malformed payload must never kill the night for the others.
+
+    ``live_clock_check`` gates the wall-clock guards (cutoff-not-reached, newest-obs
+    lag). They assume a near-real-time run, so a deliberate BACKFILL of a past date
+    turns them off -- for a backfill "now" is not a meaningful reference, and the
+    snapshot-tolerance + parity gate still protect correctness.
     """
     cutoff = pd.Timestamp(date) + pd.Timedelta(hours=CUTOFF_HOUR_LST)
 
     # Refuse to forecast an evening that has not reached its cutoff yet -- there is
     # no 18:00 observation to use, so any snapshot would be from earlier and
-    # warm-biased. (Skipped for backfills where the caller passes a past now_lst.)
+    # warm-biased.
     if now_lst is None:
         now_lst = _now_lst(station)
-    if now_lst < cutoff:
+    if live_clock_check and now_lst < cutoff:
         return StationResult(station, False,
                              f"cutoff {cutoff} not yet reached (now {now_lst} LST)")
 
     try:
         obs = live.fetch_window(station, cutoff)
+
+        # Clock-sanity check: compare the provider's newest observation against
+        # wall-clock LST. This is the ONE check that catches a wrong isd.lst_offset
+        # (the Stage-2 timezone bug) -- an offset error desynchronises the two: a
+        # +1h error puts the newest obs in the future (negative lag), a -1h error
+        # makes it look staler than any real reporting cadence. (The snapshot-hour
+        # check below cannot catch this, because it reads the same mis-stamped
+        # times as the cutoff comparison.)
+        if live_clock_check and not obs.empty:
+            newest = pd.Timestamp(obs["lst"].max())
+            lag = now_lst - newest
+            if not (pd.Timedelta(0) <= lag <= pd.Timedelta(minutes=90)):
+                return StationResult(
+                    station, False,
+                    f"newest obs {newest} is {lag} from now ({now_lst} LST) -- "
+                    "provider clock or LST offset looks wrong")
+
         feats = prepare.build_feature_row(
             obs, cutoff, cutoff_tol_minutes=LIVE_CUTOFF_TOL_MIN)
         if feats is None:
@@ -107,15 +135,15 @@ def _forecast_one(station, date, artifact, alarm_threshold_c,
                 station, False,
                 f"no usable snapshot within {LIVE_CUTOFF_TOL_MIN} min of cutoff")
 
-        # Assert the DATA, not the arithmetic: the snapshot used must be the
-        # cutoff hour (18) or the hour before (17), never earlier. A timezone slip
-        # or a mistimed run shows up here as a wrong snapshot hour.
+        # Backstop only: with a 40-min tolerance a surviving snapshot is already
+        # necessarily hour 17 or 18, so this can currently never fire. Kept so that
+        # widening the tolerance past 60 min re-arms a floor -- it is NOT an
+        # independent timezone check (see the clock-sanity check above for that).
         snap = pd.Timestamp(feats["snapshot_ts"])
         if snap.hour not in (CUTOFF_HOUR_LST - 1, CUTOFF_HOUR_LST):
             return StationResult(
                 station, False,
-                f"snapshot hour {snap.hour} LST not in ({CUTOFF_HOUR_LST-1},"
-                f"{CUTOFF_HOUR_LST}) -- possible timezone/timing error")
+                f"snapshot hour {snap.hour} LST outside the cutoff window")
 
         tmin = float(artifact.predict(pd.DataFrame([feats]))[0])
     except live.OgimetError as exc:
@@ -172,12 +200,16 @@ def _record_run(session, station, date, result):
 
 
 def run(session, dates=None, stations=None, alarm_threshold_c=None,
-        artifact=None) -> list[StationResult]:
+        artifact=None, live_clock_check=True, now_lst=None) -> list[StationResult]:
     """Run the nightly job for a date (default: today) across serviceable stations.
 
     Loads the frozen artifact (asserting feature names) unless one is injected.
     Applies the seasonal guard, then for each station fetches/validates/predicts
     and stores richly. Returns a result per station for logging/monitoring.
+
+    ``live_clock_check`` (default True) enforces the wall-clock guards for a live
+    run; a backfill of a past date passes False. ``now_lst`` overrides wall clock
+    (tests / deterministic runs).
     """
     # FEATURES is imported from the training module because it IS the load-time
     # assertion (the deployed feature list must equal the trained one). The
@@ -199,7 +231,8 @@ def run(session, dates=None, stations=None, alarm_threshold_c=None,
             log.info("out of season (%s); skipping", date)
             continue
         for station in stations:
-            res = _forecast_one(station, date, artifact, alarm_threshold_c)
+            res = _forecast_one(station, date, artifact, alarm_threshold_c,
+                                now_lst=now_lst, live_clock_check=live_clock_check)
             if res.stored:
                 _store(session, date, res, artifact.model_version, alarm_threshold_c)
                 log.info("%s %s: %.1f C alarm=%s", station, date,

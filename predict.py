@@ -75,11 +75,16 @@ def fit_and_save() -> None:
             "mae_c_full": mae_full,
             "mae_c_live": mae_live,
             "cloud_train_serve_skew": (
-                "The model is trained with cloud_oktas, but the live service runs "
-                "with it missing (no serviceable station supplies it in the "
-                "training form), which shifts radiative_potential to its "
-                "cloud-missing default. mae_c_live is the accuracy this produces; "
-                "mae_c_full is the with-cloud figure. See README (Live service)."),
+                "ACCEPTED train/serve skew (deliberate, not a bug). The model is "
+                "trained with cloud_oktas, but the live service runs with it "
+                "missing (no serviceable station supplies it in the training form), "
+                "which shifts radiative_potential to its cloud-missing default. "
+                "This is accepted rather than closed: cloud is a real frost driver "
+                "and kept in the model, and the cost is small and measured -- "
+                "mae_c (and mae_c_live) is the cloud-blank accuracy the service "
+                "actually delivers, vs mae_c_full with cloud. To close it later, "
+                "either retrain without cloud or supply cloud from a separate "
+                "source. See README (Live service)."),
         },
         path=MODEL_PATH,
     )

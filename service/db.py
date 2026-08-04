@@ -5,18 +5,23 @@ in tests. The models below are written to run on both -- portable column types,
 JSON stored as text where a native JSON type is not guaranteed -- so the fast
 offline suite never needs a running Postgres.
 
-Two tables carry the service's state:
+Four tables carry the service's state:
 
-- ``forecasts`` -- one row per (station, night), stored RICHLY: not just the
-  prediction but the full feature vector, the model version, and the cutoff
-  timestamp. Scoring forecasts later is out of scope, but the data to diagnose
-  "which nights did it miss, and what did they share" must be captured now; it is
-  free at write time and irreplaceable afterwards. ``unique(station, date)`` makes
-  the nightly job idempotent.
+- ``forecasts`` -- one row per (station, night), stored RICHLY: the full feature
+  vector, the model version, the intended cutoff and the actual snapshot time.
+  Scoring forecasts later is out of scope, but the data to diagnose "which nights
+  did it miss, and what did they share" must be captured now; it is free at write
+  time and irreplaceable afterwards. ``unique(station, date)`` makes the nightly
+  job idempotent.
 - ``subscribers`` -- who to notify, how (nightly heartbeat vs frost-only), at what
-  threshold, and whether their phone is verified. A separate ``sent_notifications``
-  log with a uniqueness constraint makes the notify step idempotent: a retry after
-  a partial failure can never double-text.
+  threshold, and their phone/verification state.
+- ``sent_notifications`` -- the delivery log. Its ``unique(subscriber, date)``
+  makes the CLAIM idempotent (a night is claimed once), and its ``status`` tracks
+  delivery. Semantics are at-least-once with bounded duplicates -- claim before
+  send, retry on failure -- the right trade for a warning system (a dropped frost
+  message costs a crop; a duplicate costs a mild annoyance). See its own docstring.
+- ``station_runs`` -- one row per (station, night) attempted, so the service can
+  answer "did every station run?" and distinguish a skip from a never-ran.
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ import datetime as _dt
 
 from sqlalchemy import (
     Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text,
-    UniqueConstraint, create_engine,
+    UniqueConstraint, create_engine, text,
 )
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import (
@@ -73,7 +78,10 @@ class Forecast(Base):
     model_version: Mapped[str] = mapped_column(String(64))
     features_json: Mapped[str] = mapped_column(Text)        # the exact feature vector
     cutoff_ts: Mapped[str] = mapped_column(String(32))      # intended 18:00 LST cutoff, ISO
-    snapshot_ts: Mapped[str] = mapped_column(String(32))    # LST of the obs actually used
+    # LST of the obs actually used. Nullable so a migration can add it to a table
+    # of pre-existing rows (which genuinely don't know their snapshot time) without
+    # a dishonest backfill; new rows always set it.
+    snapshot_ts: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     @property
@@ -99,20 +107,31 @@ class Subscriber(Base):
     # counter and an expiry so it cannot be brute-forced or replayed indefinitely.
     verify_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     verify_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # Stored directly (not reconstructed from the expiry) so a change to the code
+    # TTL cannot silently misread historical rows when computing the cooldown.
+    verify_code_issued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     verify_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
     # Soft-delete: unsubscribing sets active=False rather than deleting the row, so
     # the send audit trail survives and a same-night re-subscribe reuses the row
-    # (no duplicate text under a fresh id).
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # (no duplicate text under a fresh id). server_default so a migration adding
+    # this column to an existing table leaves every current subscriber ACTIVE --
+    # without it the ALTER would default them to inactive, a fleet-wide silent
+    # denial of warning delivered by the migration itself.
+    active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("1"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
     unsubscribed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
 
+    # No delete-orphan cascade: subscribers are soft-deleted (active=False), and
+    # the send-history audit trail must survive. A stray hard delete should error
+    # on the FK rather than silently destroy the log the soft-delete preserves.
     sends: Mapped[list["SentNotification"]] = relationship(
-        back_populates="subscriber", cascade="all, delete-orphan")
+        back_populates="subscriber", passive_deletes=True)
 
 
 class SentNotification(Base):

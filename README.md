@@ -199,13 +199,17 @@ hashes the `(estimator, features)` pair, and the loader asserts the feature name
 on load — a model scores by column position, so a silently reordered feature
 vector would mis-predict, and this refuses it.
 
-**Cloud is a documented train/serve skew.** The model is trained *with* cloud, but
+**Cloud is an accepted train/serve skew.** The model is trained *with* cloud, but
 no serviceable station supplies cloud live, so on the live path `cloud_oktas` is
 always missing and `radiative_potential` runs at its cloud-missing default. This
-is measured, not hidden: the evaluation re-runs leave-one-year-out with cloud
-blanked, and the artifact stores both `mae_c_full` (with cloud) and `mae_c_live`
-(the accuracy a grower actually receives). Forecast messages quote the live error
-as a band, because growers act on margins.
+is a deliberate, measured trade — not a bug and not hidden. Cloud is a real frost
+driver and is kept in the model; the cost of running without it live is small and
+quantified: the evaluation re-runs leave-one-year-out with cloud blanked, and the
+artifact stores both `mae_c_full` (with cloud, 1.80 °C) and `mae_c_live` (the
+1.82 °C a grower actually receives). The quoted accuracy and the SMS uncertainty
+band both use the live number. To *close* the skew later rather than accept it,
+either retrain without cloud, or supply cloud from a separate source (e.g. a
+cloud-cover model or a METAR feed).
 
 **Coverage matches training, and is asserted.** The nightly job fetches through
 the same `build_feature_row` the model was trained on, via the parity-validated

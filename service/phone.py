@@ -1,50 +1,55 @@
 """Phone-number normalisation to E.164, so one phone is one identity.
 
-``+441234567890``, ``00441234567890`` and ``01234567890`` are the same subscriber
-and must not become three rows (three texts a night, an unsubscribe that 404s).
-The phone IS the identity here, so it is normalised at the API boundary and only
-the normalised form is stored.
+Backed by the ``phonenumbers`` library (Google's libphonenumber port): a
+hand-rolled parser gets real numbers subtly wrong, and the failure mode here is a
+grower who never receives a warning -- the exact harm the service exists to
+prevent. The library handles the cases that matter even for the UK-only live
+service today: the ``+44 (0)7911...`` business-card format, and distinguishing a
+mobile (can receive SMS) from a landline (SMS silently vanishes).
 
-This is a deliberately small normaliser for the service's fixed UK/PL stations,
-not a full libphonenumber. It handles the ``+``/``00`` international prefixes and a
-national ``0`` for a configured default region. If the service ever spans many
-countries, swap this for the ``phonenumbers`` library behind the same function.
+The parsing region comes from the station (``uk_`` -> GB, ``pl_`` -> PL), not a
+global default, so the service is correct the day a non-UK station becomes
+serviceable -- but note that today every serviceable station is UK.
 """
 
 from __future__ import annotations
 
-# Default region dialling codes for turning a national "0..." number into E.164.
-_DEFAULT_CC = {"GB": "44", "PL": "48"}
+import phonenumbers
+
+# Map a station key prefix to its ISO region, for parsing national-format numbers.
+_STATION_REGION = {"uk": "GB", "pl": "PL"}
+_DEFAULT_REGION = "GB"
 
 
 class InvalidPhone(ValueError):
     pass
 
 
-def normalize_e164(raw: str, default_region: str = "GB") -> str:
-    """Return ``raw`` as an E.164 string (``+<cc><national>``), or raise InvalidPhone.
+def region_for_station(station: str) -> str:
+    """The dialling region to parse a subscriber's number in, from the station key.
 
-    Rules, in order:
-      ``+CC...``    -> kept (digits only)
-      ``00CC...``   -> ``+CC...``
-      ``0N...``     -> ``+<default cc><N...>`` (drop the national trunk 0)
+    Every serviceable station is currently UK, so this returns GB in practice; it
+    is derived from the station so a future non-UK station is handled correctly
+    without an API change."""
+    return _STATION_REGION.get(station[:2].lower(), _DEFAULT_REGION)
+
+
+def normalize_e164(raw: str, region: str = _DEFAULT_REGION) -> str:
+    """Return ``raw`` as an E.164 string, or raise InvalidPhone.
+
+    Rejects numbers that are not valid, and numbers that cannot receive SMS
+    (fixed-line): texting a landline fails silently, so it is caught at signup
+    rather than at 2am on a frost night.
     """
-    if raw is None:
+    if not raw or not raw.strip():
         raise InvalidPhone("empty phone")
-    s = "".join(ch for ch in raw.strip() if ch.isdigit() or ch == "+")
-
-    if s.startswith("+"):
-        digits = s[1:]
-    elif s.startswith("00"):
-        digits = s[2:]
-    elif s.startswith("0"):
-        cc = _DEFAULT_CC.get(default_region)
-        if cc is None:
-            raise InvalidPhone(f"unknown default region {default_region!r}")
-        digits = cc + s[1:]
-    else:
-        raise InvalidPhone(f"cannot parse {raw!r}: no +, 00, or leading 0")
-
-    if not digits.isdigit() or not (8 <= len(digits) <= 15):
-        raise InvalidPhone(f"implausible number after normalising {raw!r}")
-    return "+" + digits
+    try:
+        parsed = phonenumbers.parse(raw, region)
+    except phonenumbers.NumberParseException as exc:
+        raise InvalidPhone(f"cannot parse {raw!r}: {exc}") from exc
+    if not phonenumbers.is_valid_number(parsed):
+        raise InvalidPhone(f"not a valid number: {raw!r}")
+    ntype = phonenumbers.number_type(parsed)
+    if ntype == phonenumbers.PhoneNumberType.FIXED_LINE:
+        raise InvalidPhone("landline numbers cannot receive SMS; use a mobile")
+    return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)

@@ -75,12 +75,19 @@ def _assert_config_coherent() -> None:
             f"serviceable stations absent from the live provider: {missing}. "
             "A serviceable station must have a verified provider entry -- refusing "
             "to start rather than serve a station the parity gate never validated.")
-    # The service must never forecast a season the model was not trained on.
-    extra = [w for w in SERVICE_RISK_WINDOWS if w not in MODEL_RISK_WINDOWS]
-    if extra:
+    # The service must never forecast a date the model was not trained on. Checked
+    # by interval CONTAINMENT (every service window's endpoints fall inside a model
+    # window), not tuple identity -- so a genuine sub-interval like spring-narrowed
+    # is allowed, while a window spilling outside the model's is rejected.
+    def _covered(win) -> bool:
+        (lo, hi) = win
+        return any(mlo <= lo and hi <= mhi for mlo, mhi in MODEL_RISK_WINDOWS)
+
+    uncovered = [w for w in SERVICE_RISK_WINDOWS if not _covered(w)]
+    if uncovered:
         raise RuntimeError(
-            f"service risk windows not covered by the model: {extra}. The service "
-            "may serve fewer seasons than the model, never more.")
+            f"service risk windows not covered by the model: {uncovered}. The "
+            "service may serve a narrower season than the model, never a wider one.")
 
 
 _assert_config_coherent()

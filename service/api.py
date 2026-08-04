@@ -2,20 +2,27 @@
 
 Endpoints (all JSON, Pydantic-validated):
 
-- ``POST /api/subscribe``        create a PENDING, unverified subscriber (or update
-                                 settings on an existing one WITHOUT deactivating a
-                                 verified subscription); a code is sent to the phone.
-- ``POST /api/verify``           activate a subscriber by returning the code sent to
-                                 their phone. Rate-limited, attempt-capped, expiring.
-- ``POST /api/unsubscribe``      deactivate a subscriber -- REQUIRES a valid code,
-                                 because silently disabling a grower's frost warnings
-                                 is a bigger harm than a duplicate text.
+- ``POST /api/subscribe``        create a PENDING subscriber, OR (on a verified,
+                                 active row) apply settings immediately and send a
+                                 change-confirmation SMS -- never a silent change.
+                                 A previously-unsubscribed row re-enters the
+                                 pending/verify flow; it is never reactivated by an
+                                 unauthenticated POST.
+- ``POST /api/verify``           the ONLY path that activates a subscription
+                                 (initial or reactivation). Always requires a fresh
+                                 code. Rate-limited, attempt-capped, expiring.
+- ``POST /api/unsubscribe``      deactivate immediately and confirm by SMS. The
+                                 confirmation IS the authentication (STOP-keyword
+                                 model): an attacker cannot silently un-warn a
+                                 grower, and the grower resumes with one word.
 - ``GET  /api/forecasts/{station}`` the latest stored forecast(s) for a station.
 - ``GET  /api/stations``         the serviceable stations (for the signup dropdown).
 
-Safety posture: a verified subscriber is never silently un-verified; the phone is
-the identity, so it is normalised to E.164; the code is hashed, expires, and locks
-after too many attempts.
+Safety posture: a verified subscriber is never silently un-verified OR silently
+reconfigured (settings changes are announced); an opted-out number is never
+reactivated without a fresh code; every code-issuing path is throttled by a
+per-phone cooldown, so no endpoint is an open SMS sender; the phone is normalised
+to E.164 (per-station region); codes are hashed, expire, and lock after 5 tries.
 
 The built React frontend is served as static files from this same app. Live
 weather and real SMS are never touched here -- the SMS sender is injected (log-stub
@@ -34,8 +41,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from service import config, db
-from service.phone import InvalidPhone, normalize_e164
-from service.sms import LogSmsSender, format_verification_sms
+from service.phone import InvalidPhone, normalize_e164, region_for_station
+from service.sms import (
+    LogSmsSender, format_settings_changed_sms, format_unsubscribe_sms,
+    format_verification_sms,
+)
 
 # The serviceable set and labels come from service.config -- one source of truth,
 # an explicit literal that never falls back to "every provider station".
@@ -91,12 +101,6 @@ class UnsubscribeStartIn(BaseModel):
     station: str
 
 
-class UnsubscribeIn(BaseModel):
-    phone: str
-    station: str
-    code: str = Field(pattern=r"^\d{6}$")
-
-
 class ForecastOut(BaseModel):
     station: str
     date: str
@@ -104,7 +108,7 @@ class ForecastOut(BaseModel):
     alarm_fired: bool
     model_version: str
     cutoff_ts: str
-    snapshot_ts: str
+    snapshot_ts: str | None   # None on pre-Stage-7 rows
 
 
 class StationOut(BaseModel):
@@ -137,11 +141,25 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
             s.close()
 
     def _issue_code(sub) -> str:
+        """Issue a fresh code on ``sub``; returns the plaintext to send once.
+
+        The DB only ever holds the hash; the caller sends the returned plaintext
+        after the commit. ``verify_code_issued_at`` is stored directly rather than
+        reconstructed from the expiry, so a change to CODE_TTL cannot silently
+        misread historical rows."""
         code = f"{secrets.randbelow(1_000_000):06d}"
         sub.verify_code_hash = _hash_code(code)
         sub.verify_attempts = 0
-        sub.verify_expires_at = _now() + CODE_TTL
+        now = _now()
+        sub.verify_code_issued_at = now
+        sub.verify_expires_at = now + CODE_TTL
         return code
+
+    def _send_or_503(sndr, to, message):
+        try:
+            sndr.send(to, message)
+        except Exception:  # noqa: BLE001 -- state is committed; a resend recovers it
+            raise HTTPException(503, "could not send an SMS; please try again")
 
     @app.get("/api/stations", response_model=list[StationOut])
     def stations():
@@ -152,50 +170,64 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         if body.station not in SERVICEABLE:
             raise HTTPException(400, f"station {body.station!r} is not serviceable")
         try:
-            phone = normalize_e164(body.phone)
+            phone = normalize_e164(body.phone, region_for_station(body.station))
         except InvalidPhone as exc:
             raise HTTPException(422, f"invalid phone: {exc}")
 
         existing = (session.query(db.Subscriber)
                     .filter_by(phone=phone, station=body.station).one_or_none())
+
+        # A per-phone cooldown throttles code/SMS issue on ANY path (verified or
+        # not), so no endpoint is an unthrottled SMS sender pointed at a phone.
+        def _cooled_down(sub):
+            issued = _as_aware(sub.verify_code_issued_at) if sub else None
+            return issued is not None and issued + SUBSCRIBE_COOLDOWN > _now()
+
         if existing is None:
             sub = db.Subscriber(station=body.station, phone=phone, mode=body.mode,
                                 threshold_c=body.threshold_c, verified=False,
                                 active=True)
             code = _issue_code(sub)
             session.add(sub)
-        else:
-            # Per-phone cooldown: don't let an open endpoint re-issue codes (and
-            # send SMS) in a tight loop on someone else's number.
-            last = _as_aware(existing.verify_expires_at)
-            if (not existing.verified and last is not None
-                    and last - CODE_TTL + SUBSCRIBE_COOLDOWN > _now()):
-                raise HTTPException(429, "code recently sent; try again shortly")
-            # Update settings. Crucially, a VERIFIED subscriber stays verified and
-            # ACTIVE -- new settings apply immediately, we do not silently disable
-            # their warnings. Only an unverified/ inactive row (re)enters pending.
+            session.commit()
+            _send_or_503(sender, phone, format_verification_sms(code))
+        elif existing.verified and existing.active:
+            # Verified + active: apply settings immediately (never disable warnings)
+            # and ANNOUNCE the change, so an unauthorised edit is self-reporting.
+            if _cooled_down(existing):
+                raise HTTPException(429, "please wait before changing settings again")
             existing.mode = body.mode
             existing.threshold_c = body.threshold_c
+            existing.verify_code_issued_at = _now()   # throttle the announce SMS too
+            session.commit()
+            summary = (f"{existing.mode}"
+                       + (f" below {existing.threshold_c:+.1f} C"
+                          if existing.mode == "frost" else ""))
+            _send_or_503(sender, phone,
+                         format_settings_changed_sms(config.station_label(existing.station), summary))
             sub = existing
-            if existing.verified:
-                existing.active = True   # re-subscribe reactivates without a code
-                code = None
-            else:
-                existing.active = True
-                code = _issue_code(existing)
-        session.commit()
-        if code is not None:
-            try:
-                sender.send(phone, format_verification_sms(code))
-            except Exception:  # noqa: BLE001 -- row is written; a resend recovers it
-                raise HTTPException(503, "could not send the verification code; "
-                                         "please try again")
+        else:
+            # Unverified, OR previously unsubscribed (active=False): (re)enter the
+            # pending flow. Reactivation is NOT silent -- it requires a code, so an
+            # opted-out number cannot be switched back on by an unauthenticated POST.
+            if _cooled_down(existing):
+                raise HTTPException(429, "code recently sent; try again shortly")
+            existing.mode = body.mode
+            existing.threshold_c = body.threshold_c
+            existing.verified = False
+            code = _issue_code(existing)
+            session.commit()
+            _send_or_503(sender, phone, format_verification_sms(code))
+            sub = existing
         return SubscribeOut(id=sub.id, station=sub.station, verified=sub.verified)
 
     @app.post("/api/verify", response_model=SubscribeOut)
     def verify(body: VerifyIn, session=Depends(get_session)):
+        # Verify is the ONLY path that activates a subscription (initial or a
+        # reactivation after unsubscribe), and it always requires a fresh code --
+        # so an opted-out number can never be switched back on unauthenticated.
         try:
-            phone = normalize_e164(body.phone)
+            phone = normalize_e164(body.phone, region_for_station(body.station))
         except InvalidPhone as exc:
             raise HTTPException(422, f"invalid phone: {exc}")
         sub = (session.query(db.Subscriber)
@@ -219,56 +251,40 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         sub.active = True
         sub.verify_code_hash = None
         sub.verify_expires_at = None
+        # Clear the issue timestamp: the code is consumed, so it must no longer
+        # count toward the cooldown a subsequent legitimate settings change checks.
+        sub.verify_code_issued_at = None
         sub.verified_at = _now()
         session.commit()
         return SubscribeOut(id=sub.id, station=sub.station, verified=True)
 
     @app.post("/api/unsubscribe")
     def unsubscribe(body: UnsubscribeStartIn, session=Depends(get_session)):
-        """Start unsubscribe: send a confirmation code to the phone.
+        """Deactivate a subscription immediately and confirm by SMS.
 
-        Unsubscribing must be authenticated -- an open endpoint that disables a
-        grower's frost warnings by phone number is a real harm. This issues a code;
-        the caller confirms via /api/unsubscribe/confirm. (A real provider's
-        carrier-authenticated STOP keyword is the other legitimate path.) Always
-        returns 202 regardless of whether the subscription exists, so the endpoint
-        cannot enumerate subscribers.
+        Modelled on the carrier STOP keyword: the confirmation SMS IS the
+        authentication. An attacker who deactivates a grower cannot stop the grower
+        being told, and the grower resumes with one word (or the re-subscribe +
+        verify flow). This is safer AND lighter than a code round-trip, and it
+        never leaves a grower silently un-warned without notice.
+
+        Deactivation is a no-op if the subscription is already inactive/unknown,
+        and the response is identical either way, so the endpoint cannot enumerate
+        subscribers. Reactivation is NEVER done here -- only via re-verify.
         """
         try:
-            phone = normalize_e164(body.phone)
+            phone = normalize_e164(body.phone, region_for_station(body.station))
         except InvalidPhone as exc:
             raise HTTPException(422, f"invalid phone: {exc}")
         sub = (session.query(db.Subscriber)
                .filter_by(phone=phone, station=body.station).one_or_none())
         if sub is not None and sub.active:
-            code = _issue_code(sub)
+            sub.active = False
+            sub.unsubscribed_at = _now()
             session.commit()
-            sender.send(phone, format_verification_sms(code))
-        return {"status": "confirmation code sent if the subscription exists"}
-
-    @app.post("/api/unsubscribe/confirm")
-    def unsubscribe_confirm(body: UnsubscribeIn, session=Depends(get_session)):
-        try:
-            phone = normalize_e164(body.phone)
-        except InvalidPhone as exc:
-            raise HTTPException(422, f"invalid phone: {exc}")
-        sub = (session.query(db.Subscriber)
-               .filter_by(phone=phone, station=body.station).one_or_none())
-        bad = HTTPException(400, "invalid phone, station, or code")
-        if sub is None or sub.verify_code_hash is None:
-            raise bad
-        expires = _as_aware(sub.verify_expires_at)
-        if expires is None or expires < _now():
-            raise HTTPException(400, "code expired; request unsubscribe again")
-        if not secrets.compare_digest(sub.verify_code_hash, _hash_code(body.code)):
-            raise bad
-        # Soft-delete: keep the row (and its send history) but deactivate.
-        sub.active = False
-        sub.unsubscribed_at = _now()
-        sub.verify_code_hash = None
-        sub.verify_expires_at = None
-        session.commit()
-        return {"unsubscribed": True}
+            _send_or_503(sender, phone,
+                         format_unsubscribe_sms(config.station_label(sub.station)))
+        return {"status": "unsubscribed if the subscription existed"}
 
     @app.get("/api/forecasts/{station}", response_model=list[ForecastOut])
     def forecasts(station: str, limit: int = 7, session=Depends(get_session)):

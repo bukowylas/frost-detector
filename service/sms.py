@@ -79,3 +79,18 @@ def format_no_forecast_sms(station_label: str, date_label: str) -> str:
 def format_verification_sms(code: str) -> str:
     return (f"Your Frost Detector verification code is {code}.\n"
             f"Enter it to activate nightly frost forecasts.")
+
+
+def format_unsubscribe_sms(station_label: str) -> str:
+    """Sent when a subscription is deactivated. This confirmation IS the
+    authentication: an attacker who deactivates a grower cannot stop the grower
+    being told, and the grower resumes with one word."""
+    return (f"You've been unsubscribed from {station_label} frost forecasts.\n"
+            f"Reply START to resume.")
+
+
+def format_settings_changed_sms(station_label: str, summary: str) -> str:
+    """Sent when a verified subscriber's settings change. Makes an unauthorised
+    change self-reporting -- the grower is told, and can react."""
+    return (f"Your {station_label} frost alerts changed: {summary}.\n"
+            f"If this wasn't you, reply STOP.")

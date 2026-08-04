@@ -48,6 +48,8 @@ import pytest
 
 import prepare
 from frostlib import live, model_io, paths, physics
+from service import config
+from service.nightly_job import LIVE_CUTOFF_TOL_MIN
 
 # Features that must reproduce exactly from live observations (cloud excepted).
 EXACT_FEATURES = [
@@ -70,7 +72,7 @@ FEATURE_TOL = 0.15
 PRED_TOL_C = 0.05
 
 _OGIMET_COOLDOWN_S = 21
-_executed = {"count": 0}  # cases that actually ran their assertions (fail-closed)
+_executed = {"count": 0, "stations": set()}  # cases that actually asserted (fail-closed)
 
 
 def _load():
@@ -104,7 +106,9 @@ def _stratified_cases():
         return []
     nights = pd.read_csv(paths.NIGHTS_CSV)
     cases = []
-    for st in live.PROVIDER:
+    # Iterate the SERVICEABLE set (what the service actually serves), not the whole
+    # provider -- the gate must validate exactly the stations that will ship.
+    for st in config.SERVICEABLE_STATIONS:
         g = nights[nights.station == st]
         if g.empty:
             continue
@@ -145,8 +149,17 @@ def test_live_matches_training(station, date):
     except Exception as exc:  # noqa: BLE001 -- network unreachable: skip, not fail
         pytest.skip(f"provider unreachable: {exc}")
 
-    feats = prepare.build_feature_row(obs, cutoff)
+    # Build with the SAME tolerance the nightly job uses, so the gate validates the
+    # path production runs -- not the 90-min default the service never uses.
+    feats = prepare.build_feature_row(
+        obs, cutoff, cutoff_tol_minutes=LIVE_CUTOFF_TOL_MIN)
     assert feats is not None, f"{station} {date}: live window unusable"
+
+    # The new snapshot_ts field's contract: present, and within the live tolerance.
+    assert "snapshot_ts" in feats, f"{station} {date}: snapshot_ts missing"
+    snap_gap = cutoff - pd.Timestamp(feats["snapshot_ts"])
+    assert pd.Timedelta(0) <= snap_gap <= pd.Timedelta(minutes=LIVE_CUTOFF_TOL_MIN), (
+        f"{station} {date}: snapshot {feats['snapshot_ts']} is {snap_gap} from cutoff")
 
     # Per-feature exact equality (cloud excepted).
     for f in EXACT_FEATURES:
@@ -186,12 +199,20 @@ def test_live_matches_training(station, date):
     print(f"  {station} {date}: forecast {live_pred:.2f} C; "
           f"running cloud-blank costs {abs(blank_pred - full_pred):.3f} C here")
     _executed["count"] += 1
+    _executed["stations"].add(station)
 
 
 def test_parity_coverage():
-    """Fail-closed: a run where no case actually asserted is not a passing gate."""
+    """Fail-closed: EVERY serviceable station must have validated at least one case.
+
+    A run where only some stations executed (e.g. one rate-limited) is not a pass:
+    the gate would go green while half the fleet went unvalidated. So this requires
+    coverage of the full serviceable set, not merely that *some* case ran."""
     if not CASES:
         pytest.skip("no cases (nights.csv missing)")
-    assert _executed["count"] > 0, (
-        "no parity case executed its assertions -- all skipped (provider "
-        "rate-limited/unreachable?). A gate that checks nothing does not pass.")
+    expected = set(config.SERVICEABLE_STATIONS)
+    missing = expected - _executed["stations"]
+    assert not missing, (
+        f"parity did not validate every serviceable station -- missing {missing} "
+        f"(provider rate-limited/unreachable?). A gate that skips a served station "
+        "does not pass.")

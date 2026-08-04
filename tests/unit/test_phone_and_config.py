@@ -3,26 +3,37 @@
 import pytest
 
 from service import config
-from service.phone import InvalidPhone, normalize_e164
+from service.phone import InvalidPhone, normalize_e164, region_for_station
 
 
 class TestPhoneNormalisation:
+    # Real, valid UK mobile format (07911 xxxxxx); the phonenumbers library
+    # rejects Ofcom's fictional 07700 900xxx range as invalid, which is the point.
     @pytest.mark.parametrize("raw,expected", [
-        ("+447700900123", "+447700900123"),
-        ("00447700900123", "+447700900123"),
-        ("07700900123", "+447700900123"),        # UK national -> +44
-        ("+48 601 234 567", "+48601234567"),      # spaces stripped
+        ("+447911123456", "+447911123456"),
+        ("00447911123456", "+447911123456"),
+        ("07911123456", "+447911123456"),            # UK national -> +44
+        ("+44 (0)7911 123456", "+447911123456"),      # the (0) business-card format
     ])
     def test_variants_normalise_to_e164(self, raw, expected):
-        assert normalize_e164(raw) == expected
+        assert normalize_e164(raw, "GB") == expected
 
     def test_polish_national_uses_pl_region(self):
-        assert normalize_e164("0601234567", default_region="PL") == "+48601234567"
+        assert normalize_e164("601234567", region="PL") == "+48601234567"
+
+    def test_landline_is_rejected(self):
+        # A UK landline (020 = London) cannot receive SMS -> caught at signup.
+        with pytest.raises(InvalidPhone):
+            normalize_e164("02079460958", "GB")
 
     @pytest.mark.parametrize("bad", ["", "hello", "12345", "+++"])
-    def test_unparseable_raises(self, bad):
+    def test_unparseable_or_invalid_raises(self, bad):
         with pytest.raises(InvalidPhone):
-            normalize_e164(bad)
+            normalize_e164(bad, "GB")
+
+    def test_region_derived_from_station_key(self):
+        assert region_for_station("uk_waddington") == "GB"
+        assert region_for_station("pl_lublinek_lodz") == "PL"
 
 
 class TestServiceConfig:
