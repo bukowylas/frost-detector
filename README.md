@@ -2,9 +2,9 @@
 
 **Overnight-frost forecasting for growers, from an ordinary weather station.**
 
-Frost Detector predicts *tomorrow morning's minimum temperature* at a site from
-that evening's surface weather, and turns it into a frost alarm a grower can act
-on — run wind machines, light heaters, deploy sprinklers, or harvest early.
+Frost Detector predicts the overnight minimum temperature at a site from that
+evening's surface weather, and turns it into a frost alarm a grower can act on —
+run wind machines, light heaters, deploy sprinklers, or harvest early.
 
 It uses only **free, global surface observations** (NOAA ISD), so it can run at
 any of thousands of weather stations with no proprietary inputs. It is
