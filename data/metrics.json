@@ -138,6 +138,143 @@
       }
     ]
   },
+  "leave_one_year_out_cloud_blank_live": {
+    "mae_mean": 1.815,
+    "mae_min": 1.717,
+    "mae_max": 2.018,
+    "rmse_mean": 2.273,
+    "mae_climatology_mean": 2.944,
+    "mae_fao_mean": 1.869,
+    "margin_vs_fao_mean": -0.055,
+    "margin_vs_fao_min": -0.138,
+    "margin_vs_fao_max": 0.064,
+    "mae_calm_mean": 1.946,
+    "mae_windy_mean": 1.785,
+    "recommended_alarm_c": 1.5,
+    "frost_recall_pooled": 0.755,
+    "frost_precision_pooled": 0.646,
+    "alarm_sweep_model": {
+      "0.0": {
+        "recall": 0.526,
+        "precision": 0.828
+      },
+      "0.5": {
+        "recall": 0.608,
+        "precision": 0.758
+      },
+      "1.0": {
+        "recall": 0.668,
+        "precision": 0.699
+      },
+      "1.5": {
+        "recall": 0.755,
+        "precision": 0.646
+      },
+      "2.0": {
+        "recall": 0.795,
+        "precision": 0.588
+      }
+    },
+    "alarm_sweep_fao": {
+      "0.0": {
+        "recall": 0.529,
+        "precision": 0.795
+      },
+      "0.5": {
+        "recall": 0.579,
+        "precision": 0.746
+      },
+      "1.0": {
+        "recall": 0.637,
+        "precision": 0.703
+      },
+      "1.5": {
+        "recall": 0.727,
+        "precision": 0.666
+      },
+      "2.0": {
+        "recall": 0.782,
+        "precision": 0.607
+      }
+    },
+    "per_fold": [
+      {
+        "fold": "2019",
+        "n_train": 4800,
+        "n_test": 1203,
+        "mae_model": 1.887,
+        "rmse_model": 2.343,
+        "mae_climatology": 3.089,
+        "mae_fao": 1.997,
+        "mae_margin_vs_fao": -0.111,
+        "mae_calm": 2.11,
+        "mae_windy": 1.836,
+        "n_calm": 205,
+        "n_windy": 997,
+        "n_wind_missing": 1
+      },
+      {
+        "fold": "2020",
+        "n_train": 4820,
+        "n_test": 1183,
+        "mae_model": 1.722,
+        "rmse_model": 2.15,
+        "mae_climatology": 2.797,
+        "mae_fao": 1.86,
+        "mae_margin_vs_fao": -0.138,
+        "mae_calm": 1.699,
+        "mae_windy": 1.723,
+        "n_calm": 203,
+        "n_windy": 976,
+        "n_wind_missing": 4
+      },
+      {
+        "fold": "2021",
+        "n_train": 4785,
+        "n_test": 1218,
+        "mae_model": 1.717,
+        "rmse_model": 2.179,
+        "mae_climatology": 2.853,
+        "mae_fao": 1.751,
+        "mae_margin_vs_fao": -0.034,
+        "mae_calm": 2.034,
+        "mae_windy": 1.655,
+        "n_calm": 199,
+        "n_windy": 1018,
+        "n_wind_missing": 1
+      },
+      {
+        "fold": "2022",
+        "n_train": 4816,
+        "n_test": 1187,
+        "mae_model": 2.018,
+        "rmse_model": 2.54,
+        "mae_climatology": 2.914,
+        "mae_fao": 1.954,
+        "mae_margin_vs_fao": 0.064,
+        "mae_calm": 2.171,
+        "mae_windy": 1.976,
+        "n_calm": 253,
+        "n_windy": 933,
+        "n_wind_missing": 1
+      },
+      {
+        "fold": "2023",
+        "n_train": 4791,
+        "n_test": 1212,
+        "mae_model": 1.731,
+        "rmse_model": 2.154,
+        "mae_climatology": 3.068,
+        "mae_fao": 1.784,
+        "mae_margin_vs_fao": -0.053,
+        "mae_calm": 1.718,
+        "mae_windy": 1.734,
+        "n_calm": 221,
+        "n_windy": 991,
+        "n_wind_missing": 0
+      }
+    ]
+  },
   "leave_one_station_out": {
     "mae_mean": 1.651,
     "mae_min": 1.288,

@@ -41,14 +41,16 @@ pass having checked nothing is not a gate.
 """
 
 import math
+import sys
 import time
 
-import joblib
 import pandas as pd
 import pytest
 
 import prepare
-from frostlib import live, paths, physics
+from frostlib import live, model_io, paths, physics
+from service import config
+from service.nightly_job import LIVE_CUTOFF_TOL_MIN
 
 # Features that must reproduce exactly from live observations (cloud excepted).
 EXACT_FEATURES = [
@@ -71,14 +73,17 @@ FEATURE_TOL = 0.15
 PRED_TOL_C = 0.05
 
 _OGIMET_COOLDOWN_S = 21
-_executed = {"count": 0}  # cases that actually ran their assertions (fail-closed)
+_executed = {"count": 0, "stations": set()}  # cases that actually asserted (fail-closed)
 
 
 def _load():
     if not paths.MODEL_PATH.exists() or not paths.NIGHTS_CSV.exists():
         pytest.skip("model artifact or nights.csv missing")
-    bundle = joblib.load(paths.MODEL_PATH)
-    return bundle["model"], bundle["features"], pd.read_csv(paths.NIGHTS_CSV)
+    try:
+        artifact = model_io.load_model(path=paths.MODEL_PATH)
+    except model_io.ModelContractError as exc:
+        pytest.skip(f"model artifact needs re-freezing (predict.py --fit): {exc}")
+    return artifact.model, artifact.features, pd.read_csv(paths.NIGHTS_CSV)
 
 
 def _extreme_date(g, col, how):
@@ -102,7 +107,9 @@ def _stratified_cases():
         return []
     nights = pd.read_csv(paths.NIGHTS_CSV)
     cases = []
-    for st in live.PROVIDER:
+    # Iterate the SERVICEABLE set (what the service actually serves), not the whole
+    # provider -- the gate must validate exactly the stations that will ship.
+    for st in config.SERVICEABLE_STATIONS:
         g = nights[nights.station == st]
         if g.empty:
             continue
@@ -117,14 +124,40 @@ def _stratified_cases():
 
 
 CASES = _stratified_cases()
+_N_CASES = len(CASES)
+
+# The wall-clock time of the last OGIMET query, so pacing waits only the minimum
+# remaining out of the 20 s rate limit -- never a full fixed sleep, never after the
+# final case, and never on the non-network coverage test. `n` counts cases started,
+# for progress reporting (the run is mostly rate-limit waiting, so show it).
+_last_query = {"at": 0.0}
+_progress = {"n": 0}
 
 
-@pytest.fixture(autouse=True)
-def _pace_ogimet():
-    """Sleep AFTER every case (pass or fail) so a failing assertion never removes
-    the pacing and cascades the rest into rate-limit skips."""
-    yield
-    time.sleep(_OGIMET_COOLDOWN_S)
+def _log(msg):
+    """Progress to stderr, flushed, so a ~100 s rate-limited run is not a silent
+    black box. Visible with `-s`."""
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _paced_fetch(station, date, cutoff):
+    """Fetch, waiting only as long as OGIMET's 1-query-per-20-s limit requires
+    since the previous query. Pacing lives around the fetch itself, so a failing
+    assertion later in the test can never remove it. Reports progress at each step."""
+    _progress["n"] += 1
+    i = _progress["n"]
+    wait = _OGIMET_COOLDOWN_S - (time.monotonic() - _last_query["at"])
+    if wait > 0:
+        _log(f"[{i}/{_N_CASES}] {station} {date}: waiting {wait:.0f}s (OGIMET rate limit)...")
+        time.sleep(wait)
+    _log(f"[{i}/{_N_CASES}] {station} {date}: fetching...")
+    t0 = time.monotonic()
+    try:
+        obs = live.fetch_window(station, cutoff)
+    finally:
+        _last_query["at"] = time.monotonic()
+    _log(f"[{i}/{_N_CASES}] {station} {date}: fetched in {time.monotonic()-t0:.1f}s, {len(obs)} obs")
+    return obs
 
 
 @pytest.mark.parametrize("station,date", CASES)
@@ -137,14 +170,23 @@ def test_live_matches_training(station, date):
     cutoff = pd.Timestamp(date) + pd.Timedelta(hours=prepare.CUTOFF_HOUR)
 
     try:
-        obs = live.fetch_window(station, cutoff)
+        obs = _paced_fetch(station, date, cutoff)
     except live.OgimetError as exc:
         pytest.skip(f"provider declined (rate-limit/error body): {exc}")
     except Exception as exc:  # noqa: BLE001 -- network unreachable: skip, not fail
         pytest.skip(f"provider unreachable: {exc}")
 
-    feats = prepare.build_feature_row(obs, cutoff)
+    # Build with the SAME tolerance the nightly job uses, so the gate validates the
+    # path production runs -- not the 90-min default the service never uses.
+    feats = prepare.build_feature_row(
+        obs, cutoff, cutoff_tol_minutes=LIVE_CUTOFF_TOL_MIN)
     assert feats is not None, f"{station} {date}: live window unusable"
+
+    # The new snapshot_ts field's contract: present, and within the live tolerance.
+    assert "snapshot_ts" in feats, f"{station} {date}: snapshot_ts missing"
+    snap_gap = cutoff - pd.Timestamp(feats["snapshot_ts"])
+    assert pd.Timedelta(0) <= snap_gap <= pd.Timedelta(minutes=LIVE_CUTOFF_TOL_MIN), (
+        f"{station} {date}: snapshot {feats['snapshot_ts']} is {snap_gap} from cutoff")
 
     # Per-feature exact equality (cloud excepted).
     for f in EXACT_FEATURES:
@@ -181,15 +223,26 @@ def test_live_matches_training(station, date):
 
     # The quantified cloud limitation: what running cloud-blank costs on this
     # night (informational, not an assertion) -- reported, never hidden.
-    print(f"  {station} {date}: forecast {live_pred:.2f} C; "
-          f"running cloud-blank costs {abs(blank_pred - full_pred):.3f} C here")
     _executed["count"] += 1
+    _executed["stations"].add(station)
+    _log(f"[{_progress['n']}/{_N_CASES}] {station} {date}: VALIDATED -- "
+         f"forecast {live_pred:.2f} C; cloud-blank costs "
+         f"{abs(blank_pred - full_pred):.3f} C")
 
 
 def test_parity_coverage():
-    """Fail-closed: a run where no case actually asserted is not a passing gate."""
+    """Fail-closed: EVERY serviceable station must have validated at least one case.
+
+    A run where only some stations executed (e.g. one rate-limited) is not a pass:
+    the gate would go green while half the fleet went unvalidated. So this requires
+    coverage of the full serviceable set, not merely that *some* case ran."""
     if not CASES:
         pytest.skip("no cases (nights.csv missing)")
-    assert _executed["count"] > 0, (
-        "no parity case executed its assertions -- all skipped (provider "
-        "rate-limited/unreachable?). A gate that checks nothing does not pass.")
+    expected = set(config.SERVICEABLE_STATIONS)
+    missing = expected - _executed["stations"]
+    _log(f"coverage: {_executed['count']}/{_N_CASES} cases validated across "
+         f"{len(_executed['stations'])}/{len(expected)} serviceable stations")
+    assert not missing, (
+        f"parity did not validate every serviceable station -- missing {missing} "
+        f"(provider rate-limited/unreachable?). A gate that skips a served station "
+        "does not pass.")

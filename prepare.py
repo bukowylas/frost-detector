@@ -43,7 +43,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from frostlib import isd, paths, physics
+from frostlib import isd, paths, physics, season
 
 # Where this step reads and writes (frostlib.paths owns the defaults).
 RAW_DIR = paths.RAW_DIR
@@ -59,15 +59,11 @@ LATE_HOUR = 4              # a night must have an obs at/after this (near dawn)
 FEATURE_WINDOW_HOURS = 30
 # The 18:00-20:00 gap between them is excluded from both by construction.
 
-# Frost-risk windows as (month, day) ranges, inclusive.
-RISK_WINDOWS = [((3, 1), (5, 31)), ((9, 15), (11, 15))]
-
-
-def _in_risk_window(month: int, day: int) -> bool:
-    for (m0, d0), (m1, d1) in RISK_WINDOWS:
-        if (m0, d0) <= (month, day) <= (m1, d1):
-            return True
-    return False
+# Frost-risk windows are defined once in frostlib.season and shared with the live
+# service, so the training and serving paths cannot disagree about what the model
+# covers.
+RISK_WINDOWS = season.RISK_WINDOWS
+_in_risk_window = season.in_risk_window
 
 
 def decode_station(csv_path: Path) -> pd.DataFrame:
@@ -84,26 +80,24 @@ def decode_station(csv_path: Path) -> pd.DataFrame:
         if col not in raw.columns:
             raw[col] = pd.NA
     station = paths.station_name_from_path(csv_path)
-    # Start the frame from a length-carrying column; assigning a scalar to a
-    # still-empty DataFrame would create a zero-length column and silently drop
-    # every row (the station column would be empty, breaking the later groupby).
-    # Shift UTC to Local Standard Time, then drop the tz so the column is naive
-    # LST -- keeping a UTC tz-label on LST values is a trap for anything that
-    # later tz-converts or compares against a genuinely-UTC series.
     # ISD DATE is a fixed ISO format; specifying it is faster and deterministic
     # (no per-element guessing) and silences pandas' format-inference warning.
-    # errors="coerce" still turns a malformed value into NaT rather than raising.
+    # errors="coerce" turns a malformed value into NaT rather than raising; since
+    # the format is rigid, a NaT is genuinely malformed data, so surface the count
+    # rather than let those rows vanish (the coverage report tallies rejected
+    # nights, not dropped rows, so the loss would otherwise be invisible).
     utc = pd.to_datetime(raw["DATE"], format="%Y-%m-%dT%H:%M:%S",
                          utc=True, errors="coerce")
-    # ISD's DATE is a rigid ISO format, so a coerced NaT is genuinely malformed
-    # data, not a format variant. Those rows get dropped below; surface the count
-    # rather than let a parsing change silently discard observations -- the
-    # coverage report tallies rejected nights, not dropped rows, so this loss
-    # would otherwise be invisible.
     n_unparsed = int(utc.isna().sum())
     if n_unparsed:
         print(f"  {station}: {n_unparsed} row(s) with an unparseable DATE dropped")
+    # Shift UTC to Local Standard Time, then drop the tz so the column is naive LST
+    # -- keeping a UTC tz-label on LST values is a trap for anything that later
+    # tz-converts or compares against a genuinely-UTC series.
     lst = (utc + pd.to_timedelta(isd.lst_offset(station), unit="h")).dt.tz_localize(None)
+    # Start the frame from this length-carrying column; assigning a scalar to a
+    # still-empty DataFrame would create a zero-length column and silently drop
+    # every row (the station column would be empty, breaking the later groupby).
     out = pd.DataFrame({"lst": lst})
     out["station"] = station
     out["lat"] = pd.to_numeric(raw["LATITUDE"], errors="coerce")
@@ -138,12 +132,21 @@ def _nearest_at_or_before(day_obs: pd.DataFrame, target, tol_minutes=90,
     return row
 
 
-def build_feature_row(obs: pd.DataFrame, cutoff) -> dict | None:
+def build_feature_row(obs: pd.DataFrame, cutoff,
+                      cutoff_tol_minutes: int = 90) -> dict | None:
     """The model's input features for one station-night, or None if unusable.
 
     THE single feature builder: the training path (``build_nights`` below) and
     the live path must both call this, so the live service cannot drift into
     feeding the model a subtly different vector than it was trained on.
+
+    ``cutoff_tol_minutes`` bounds how far before ``cutoff`` the snapshot may be:
+    90 minutes for training (ISD gaps are random, so the error is noise), but the
+    live path passes a tighter value, because a systematically-early snapshot
+    (a mistimed run) would be warm-biased -- the under-warning direction. The
+    returned dict carries ``snapshot_ts``: the timestamp of the observation
+    actually used, so a caller can store the real snapshot time, not the intended
+    cutoff.
 
     ``obs`` is one station's observations covering (at least) the run-up to
     ``cutoff``; only the last ``FEATURE_WINDOW_HOURS`` up to the cutoff are used,
@@ -161,7 +164,8 @@ def build_feature_row(obs: pd.DataFrame, cutoff) -> dict | None:
     # and an unstable sort would reorder them, changing which one is "last".
     window = obs[(obs["lst"] >= cutoff - pd.Timedelta(hours=FEATURE_WINDOW_HOURS))
                  & (obs["lst"] <= cutoff)].sort_values("lst", kind="stable")
-    at = _nearest_at_or_before(window, cutoff, require_col="temp_c")
+    at = _nearest_at_or_before(window, cutoff, tol_minutes=cutoff_tol_minutes,
+                               require_col="temp_c")
     if at is None or pd.isna(at["dewpoint_c"]):
         return None
 
@@ -173,10 +177,13 @@ def build_feature_row(obs: pd.DataFrame, cutoff) -> dict | None:
     at_24h_t = _nearest_at_or_before(window, lag24, require_col="temp_c")
     at_3h_p = _nearest_at_or_before(window, lag3, require_col="slp_hpa")
 
-    # Radiative-cooling potential, from frostlib.physics so a live caller and
-    # the training rows cannot compute it differently. Its missing-data defaults
-    # feed only this derived term; the raw cloud/wind features stay missing,
-    # which the model handles natively.
+    # Radiative-cooling potential, from frostlib.physics so a live caller and the
+    # training rows cannot compute it differently. NOTE: when cloud is missing this
+    # term falls back to physics' cloud default rather than staying NaN. In
+    # training cloud is usually present; on the live service it is always missing,
+    # so this feature runs at its cloud-missing default every night -- a train/serve
+    # skew, quantified by the cloud-blank live MAE (see train.py / the artifact's
+    # mae_c_live). It is a documented limitation, not "handled for free".
     radiative_potential = physics.radiative_potential(
         at["cloud_oktas"], at["wind_ms"])
 
@@ -188,7 +195,13 @@ def build_feature_row(obs: pd.DataFrame, cutoff) -> dict | None:
     return {
         "month": cutoff.month,
         "doy": int(cutoff.dayofyear),
-        "lat": at["lat"], "lon": at["lon"], "elev": at["elev"],
+        # Static geography, cast defensively like the observed fields -- a live
+        # provider yielding these as strings would otherwise make an object-dtype
+        # column the model rejects.
+        "lat": float(at["lat"]), "lon": float(at["lon"]), "elev": float(at["elev"]),
+        # The timestamp of the observation actually used as the cutoff snapshot,
+        # so a caller stores the real snapshot time, not the intended cutoff.
+        "snapshot_ts": pd.Timestamp(at["lst"]).isoformat(),
         # cutoff snapshot
         "temp_c": float(at["temp_c"]),
         "dewpoint_c": float(at["dewpoint_c"]),
