@@ -1,0 +1,37 @@
+# One-command stack: Postgres + the app (API + UI). Cloud-agnostic -- runnable on
+# a VPS or any container host. The nightly job runs as a scheduled invocation of
+# the same image (a host cron / systemd timer calls `run-nightly`, or a compose
+# `run` on a timer); it is not a long-running service.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: frost
+      POSTGRES_PASSWORD: frost
+      POSTGRES_DB: frost
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U frost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://frost:frost@db:5432/frost
+    ports:
+      - "8000:8000"
+    # Apply migrations, then serve. (Fitting the model artifact is a one-off
+    # deploy step run separately: `docker compose run --rm app python3 predict.py --fit`.)
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn service.api:create_app --factory --host 0.0.0.0 --port 8000"
+
+volumes:
+  pgdata:

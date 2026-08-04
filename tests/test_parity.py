@@ -43,12 +43,11 @@ pass having checked nothing is not a gate.
 import math
 import time
 
-import joblib
 import pandas as pd
 import pytest
 
 import prepare
-from frostlib import live, paths, physics
+from frostlib import live, model_io, paths, physics
 
 # Features that must reproduce exactly from live observations (cloud excepted).
 EXACT_FEATURES = [
@@ -77,8 +76,11 @@ _executed = {"count": 0}  # cases that actually ran their assertions (fail-close
 def _load():
     if not paths.MODEL_PATH.exists() or not paths.NIGHTS_CSV.exists():
         pytest.skip("model artifact or nights.csv missing")
-    bundle = joblib.load(paths.MODEL_PATH)
-    return bundle["model"], bundle["features"], pd.read_csv(paths.NIGHTS_CSV)
+    try:
+        artifact = model_io.load_model(path=paths.MODEL_PATH)
+    except model_io.ModelContractError as exc:
+        pytest.skip(f"model artifact needs re-freezing (predict.py --fit): {exc}")
+    return artifact.model, artifact.features, pd.read_csv(paths.NIGHTS_CSV)
 
 
 def _extreme_date(g, col, how):

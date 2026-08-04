@@ -1,0 +1,17 @@
+# Runtime dependencies for the Frost Detector model pipeline and live service.
+# Pinned to the versions the project was built and tested against.
+
+# Model pipeline
+pandas==3.0.5
+numpy==2.5.1
+scikit-learn==1.7.0
+joblib==1.5.1
+requests==2.32.4
+
+# Live service
+fastapi==0.140.0
+uvicorn==0.51.0
+pydantic==2.13.4
+SQLAlchemy==2.0.51
+alembic==1.18.5
+psycopg[binary]==3.3.4

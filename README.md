@@ -182,3 +182,71 @@ investigation probes and are not collected.
 python3 -m pytest                                     # unit suite
 python3 -m pytest --cov=. --cov-report=term-missing    # with coverage
 ```
+
+## Live service
+
+The `service/` package runs the trained model as a seasonal forecast service:
+each evening in the frost-risk window it fetches live weather, runs the frozen
+model, stores the forecast, and can text subscribed growers. It is a portfolio
+demonstration of deploying the model — subscribers are the author and consenting
+friends, and SMS defaults to a no-cost stub that logs messages instead of sending
+them.
+
+**One model, frozen.** The service never refits on demand. `predict.py --fit`
+saves a versioned artifact (`frostlib/model_io.py`) carrying the estimator, its
+feature names, the training years and stations, and the measured MAE. The version
+hashes the `(estimator, features)` pair, and the loader asserts the feature names
+on load — a model scores by column position, so a silently reordered feature
+vector would mis-predict, and this refuses it.
+
+**Cloud is a documented train/serve skew.** The model is trained *with* cloud, but
+no serviceable station supplies cloud live, so on the live path `cloud_oktas` is
+always missing and `radiative_potential` runs at its cloud-missing default. This
+is measured, not hidden: the evaluation re-runs leave-one-year-out with cloud
+blanked, and the artifact stores both `mae_c_full` (with cloud) and `mae_c_live`
+(the accuracy a grower actually receives). Forecast messages quote the live error
+as a band, because growers act on margins.
+
+**Coverage matches training, and is asserted.** The nightly job fetches through
+the same `build_feature_row` the model was trained on, via the parity-validated
+live path. The serviceable stations are an explicit list in `service/config.py`,
+asserted at import to be a subset of what the parity gate validated — there is no
+fallback that could silently widen coverage. The model is trained on spring *and*
+autumn (autumn measurably helps and is when unharvested fruit is on the tree);
+this build **serves spring only**, one config constant away from autumn.
+
+**Delivery is a warning system, not a newsletter.** Sends are at-least-once with
+bounded duplicates (a dropped frost warning costs a crop; a duplicate costs a mild
+annoyance): each notification is claimed `pending` before the send and marked
+`sent` after, so a crash never drops a message and a retry never double-texts. A
+`nightly` subscriber whose station was skipped gets an explicit "no forecast"
+message — silence is ambiguous between "clear" and "the system is down".
+
+**Components** (`service/`): `config.py` (the single source of truth for stations,
+labels, season, threshold), the nightly job (`nightly_job.py` — seasonal guard,
+validate-never-impute, idempotent, snapshot-time asserted, one station's failure
+never kills the night), the database (`db.py` + Alembic migrations — forecasts and
+station-runs stored richly), the API (`api.py` — FastAPI: subscribe, phone
+verification with expiring attempt-capped codes, coded unsubscribe, forecast
+reads; serves the built React UI; phones normalised to E.164), SMS
+(`sms.py`/`notify.py` — pluggable interface, log-stub default), and the React
+signup UI (`web/`).
+
+**Run it locally** (SQLite + log-stub SMS, no Postgres, no real texts):
+
+```
+python3 predict.py --fit                       # freeze the model artifact
+python3 -m service.run_nightly --date 2026-04-15   # forecast -> store -> notify
+FROST_BOOTSTRAP_DB=1 uvicorn service.api:create_app --factory --reload  # API+UI :8000
+cd web && npm install && npm run build         # build the frontend it serves
+```
+
+(`FROST_BOOTSTRAP_DB=1` lets the app create the schema directly for local dev;
+production applies Alembic migrations instead, so a boot never races them.)
+
+**Or the full stack** (Postgres + app in one command):
+
+```
+docker compose up --build                              # runs `alembic upgrade head`
+docker compose run --rm app python3 predict.py --fit   # one-off: fit the model
+```

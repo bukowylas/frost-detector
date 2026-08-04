@@ -53,7 +53,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import RandomizedSearchCV
 
-from frostlib import paths
+from frostlib import paths, physics
 from frostlib.progress import Timer
 
 DATA = paths.NIGHTS_CSV
@@ -415,10 +415,22 @@ def main() -> None:
     loco_nogeo = run_cv(df, "country", "leave-one-country-out (no geo)",
                         features=no_geo)
 
+    # The live-path accuracy. On the live service cloud_oktas is always missing
+    # (no serviceable station supplies it in the training form), so re-run LOYO
+    # with cloud blanked -- and radiative_potential recomputed from the blank --
+    # to get the MAE growers actually receive, distinct from the with-cloud
+    # headline. This is the number the deployed artifact should quote.
+    df_live = df.copy()
+    df_live["cloud_oktas"] = np.nan
+    df_live["radiative_potential"] = physics.radiative_potential_col(
+        df_live["cloud_oktas"], df_live["wind_ms"])
+    loyo_live = run_cv(df_live, "year", "leave-one-year-out (cloud-blank / live)")
+
     summary = {
         "n_nights": len(df),
         "n_stations": int(df["station"].nunique()),
         "leave_one_year_out": summarise(loyo, "LOYO"),
+        "leave_one_year_out_cloud_blank_live": summarise(loyo_live, "LOYO-live"),
         "leave_one_station_out": summarise(loso, "LOSO"),
         "leave_one_country_out": summarise(loco, "LOCO"),
         "leave_one_country_out_no_geo": summarise(loco_nogeo, "LOCO-nogeo"),

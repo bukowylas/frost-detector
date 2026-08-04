@@ -22,12 +22,13 @@ import os
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-import joblib
+import json
+
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-from frostlib import physics
-from frostlib.paths import MODEL_PATH
+from frostlib import model_io, physics
+from frostlib.paths import METRICS_JSON, MODEL_PATH
 from train import (
     DATA,
     FEATURES,
@@ -37,15 +38,53 @@ from train import (
 )
 
 
+def _measured_mae() -> tuple[float | None, float | None]:
+    """(full-feature MAE, live/cloud-blank MAE) from the evaluation metrics.
+
+    The full number is measured with real cloud; the live number is measured with
+    ``cloud_oktas`` forced missing -- the regime the live service actually runs in
+    (no serviceable station supplies cloud). The live figure is the accuracy a
+    grower receives; the artifact stores both so the distinction is never lost.
+    Absent if the metrics file has not been written; the freeze still proceeds.
+    """
+    if not METRICS_JSON.exists():
+        return None, None
+    metrics = json.loads(METRICS_JSON.read_text())
+    full = metrics.get("leave_one_year_out", {}).get("mae_mean")
+    live = metrics.get("leave_one_year_out_cloud_blank_live", {}).get("mae_mean")
+    return full, live
+
+
 def fit_and_save() -> None:
     df = pd.read_csv(DATA)
     # Fixed hyperparameters (shared with train.py); this script is the
     # deployment artifact, not the tuning experiment.
     model = HistGradientBoostingRegressor(**FIXED_MODEL_PARAMS)
     model.fit(df[FEATURES], df[TARGET])
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": model, "features": FEATURES}, MODEL_PATH)
-    print(f"fitted on {len(df)} nights; saved {MODEL_PATH}")
+    years = pd.to_datetime(df["date"]).dt.year.unique()
+    mae_full, mae_live = _measured_mae()
+    version = model_io.save_model(
+        model, FEATURES,
+        training_years=years,
+        training_stations=df["station"].unique(),
+        n_training_nights=len(df),
+        # mae_c is the LIVE number -- what the deployed service delivers -- not the
+        # with-cloud headline. Both are kept in extra so the skew is explicit.
+        mae_c=mae_live if mae_live is not None else mae_full,
+        extra={
+            "mae_c_full": mae_full,
+            "mae_c_live": mae_live,
+            "cloud_train_serve_skew": (
+                "The model is trained with cloud_oktas, but the live service runs "
+                "with it missing (no serviceable station supplies it in the "
+                "training form), which shifts radiative_potential to its "
+                "cloud-missing default. mae_c_live is the accuracy this produces; "
+                "mae_c_full is the with-cloud figure. See README (Live service)."),
+        },
+        path=MODEL_PATH,
+    )
+    print(f"fitted on {len(df)} nights; froze model {version} "
+          f"(mae_live={mae_live}, mae_full={mae_full})")
 
 
 def _derived(args) -> dict:
@@ -73,11 +112,14 @@ def _derived(args) -> dict:
 
 
 def forecast(args) -> None:
-    if not MODEL_PATH.exists():
-        raise SystemExit("no saved model -- run `python3 predict.py --fit` first")
-    bundle = joblib.load(MODEL_PATH)
-    row = pd.DataFrame([_derived(args)])[bundle["features"]]
-    tmin = float(bundle["model"].predict(row)[0])
+    # Assert the artifact's features match the code's, so a served row cannot be
+    # scored in the wrong column order.
+    try:
+        artifact = model_io.load_model(expected_features=FEATURES, path=MODEL_PATH)
+    except model_io.ModelContractError as exc:
+        raise SystemExit(str(exc))
+    row = pd.DataFrame([_derived(args)])
+    tmin = float(artifact.predict(row)[0])
     alarm = tmin <= RECOMMENDED_ALARM_C
     print(f"predicted overnight minimum: {tmin:+.1f} C")
     print(f"frost alarm (predicted <= {RECOMMENDED_ALARM_C:+.1f} C): "
@@ -93,18 +135,27 @@ def main() -> None:
     ap.add_argument("--wind", type=float, default=None, help="wind speed (m/s)")
     ap.add_argument("--cloud", type=float, default=None, help="cloud cover (oktas 0-8)")
     ap.add_argument("--pressure", type=float, default=None, help="sea-level pressure (hPa)")
-    ap.add_argument("--temp-change-3h", type=float, default=0.0, dest="temp_change_3h")
-    ap.add_argument("--temp-change-24h", type=float, default=0.0, dest="temp_change_24h")
-    ap.add_argument("--slp-tendency-3h", type=float, default=0.0, dest="slp_tendency_3h")
+    # Trends default to NaN, not 0.0: zero is a real, informative value ("no
+    # change") -- a substantive claim about the synoptic situation -- so an absent
+    # trend must be missing, which the model handles natively, not silently zero.
+    nan = float("nan")
+    ap.add_argument("--temp-change-3h", type=float, default=nan, dest="temp_change_3h")
+    ap.add_argument("--temp-change-24h", type=float, default=nan, dest="temp_change_24h")
+    ap.add_argument("--slp-tendency-3h", type=float, default=nan, dest="slp_tendency_3h")
     ap.add_argument("--lat", type=float, help="station latitude")
     ap.add_argument("--lon", type=float, help="station longitude")
-    ap.add_argument("--elev", type=float, default=100.0, help="station elevation (m)")
+    ap.add_argument("--elev", type=float, help="station elevation (m)")
     ap.add_argument("--doy", type=int, help="day of year")
     args = ap.parse_args()
 
     if args.fit:
         fit_and_save()
     elif args.temp is not None and args.dewpoint is not None:
+        # Geography and day-of-year are real inputs, not defaultable -- an invented
+        # elevation or coordinate is the never-impute rule broken at the CLI.
+        missing = [n for n in ("lat", "lon", "doy") if getattr(args, n) is None]
+        if missing:
+            ap.error(f"a forecast needs {', '.join('--' + m for m in missing)}")
         forecast(args)
     else:
         ap.error("either --fit, or provide at least --temp and --dewpoint")

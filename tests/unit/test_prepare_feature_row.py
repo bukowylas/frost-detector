@@ -68,7 +68,9 @@ class TestWellFormedWindow:
 
     def test_produces_exactly_the_model_features_and_nothing_label_shaped(self, row):
         import train
-        assert set(row) == set(train.FEATURES) | {"month"}
+        # The model features, plus two non-model extras carried for storage:
+        # `month` (calendar context) and `snapshot_ts` (the obs time actually used).
+        assert set(row) == set(train.FEATURES) | {"month", "snapshot_ts"}
         assert "tmin_overnight_c" not in row
 
     def test_unsorted_input_still_picks_the_cutoff_observation(self):

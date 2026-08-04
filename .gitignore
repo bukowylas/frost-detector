@@ -23,3 +23,9 @@ _cloud_cover_archive/
 # Coverage output.
 .coverage
 htmlcov/
+
+# Live-service local state: SQLite dev database and the built frontend (Vite
+# regenerates web/dist; node_modules is web/.gitignore's concern).
+*.db
+web/dist/
+web/node_modules/
