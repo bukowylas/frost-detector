@@ -1,14 +1,14 @@
 """initial schema
 
-Revision ID: e8802f0bec75
+Revision ID: 0e2207548c4f
 Revises: 
-Create Date: 2026-08-04 15:57:02.075014
+Create Date: 2026-08-04 18:00:29.034121
 """
 from alembic import op
 import sqlalchemy as sa
 
 
-revision = 'e8802f0bec75'
+revision = '0e2207548c4f'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -62,9 +62,11 @@ def upgrade() -> None:
     sa.Column('verify_attempts', sa.Integer(), nullable=False),
     sa.Column('verify_expires_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('last_sms_at', sa.DateTime(timezone=True), nullable=True),
-    # sa.true() compiles to `true` on Postgres and `1` on SQLite; a bare text('1')
-    # is rejected as an integer default on a Postgres boolean column.
+    # true()/false() compile to `true`/`false` on Postgres and `1`/`0` on SQLite;
+    # a bare text('1')/text('0') is rejected as an integer default on a Postgres
+    # boolean column (the whole point of the D1 fix).
     sa.Column('active', sa.Boolean(), server_default=sa.true(), nullable=False),
+    sa.Column('confirm_sms_pending', sa.Boolean(), server_default=sa.false(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('verified_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('unsubscribed_at', sa.DateTime(timezone=True), nullable=True),

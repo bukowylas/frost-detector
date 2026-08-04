@@ -2,15 +2,15 @@
 
 Endpoints (all JSON, Pydantic-validated):
 
-- ``POST /api/subscribe``        create a PENDING subscriber, OR (on a verified,
-                                 active row) apply settings immediately and send a
-                                 change-confirmation SMS -- never a silent change.
-                                 A previously-unsubscribed row re-enters the
-                                 pending/verify flow; it is never reactivated by an
-                                 unauthenticated POST.
-- ``POST /api/verify``           the ONLY path that activates a subscription
-                                 (initial or reactivation). Always requires a fresh
-                                 code. Rate-limited, attempt-capped, expiring.
+- ``POST /api/subscribe``        STAGE a subscription. On any row (new, unverified,
+                                 verified, opted-out) it only records the requested
+                                 mode/threshold as PENDING and issues a code; it
+                                 never changes the active settings, activates, or
+                                 reactivates. The response is opaque (no enumeration).
+- ``POST /api/verify``           the ONLY path that activates a subscription and the
+                                 ONLY path that promotes staged settings into effect.
+                                 Always requires a fresh code. Attempt-capped,
+                                 expiring.
 - ``POST /api/unsubscribe``      deactivate immediately and confirm by SMS. The
                                  confirmation IS the authentication (STOP-keyword
                                  model): an attacker cannot silently un-warn a
@@ -18,11 +18,13 @@ Endpoints (all JSON, Pydantic-validated):
 - ``GET  /api/forecasts/{station}`` the latest stored forecast(s) for a station.
 - ``GET  /api/stations``         the serviceable stations (for the signup dropdown).
 
-Safety posture: a verified subscriber is never silently un-verified OR silently
-reconfigured (settings changes are announced); an opted-out number is never
-reactivated without a fresh code; every code-issuing path is throttled by a
-per-phone cooldown, so no endpoint is an open SMS sender; the phone is normalised
-to E.164 (per-station region); codes are hashed, expire, and lock after 5 tries.
+Safety posture -- ONE rule: nothing that changes what a subscriber receives takes
+effect without a fresh code. subscribe only stages; verify promotes. So a verified
+subscriber cannot be silently reconfigured or un-verified, and an opted-out number
+cannot be reactivated, by an unauthenticated POST. Codes are hashed, expire, and
+lock after 5 attempts; the phone is normalised to E.164 (per-station region) so one
+phone is one identity; a per-phone cooldown plus a global daily send budget (the
+BudgetedSender) keep no endpoint an open SMS sender.
 
 The built React frontend is served as static files from this same app. Live
 weather and real SMS are never touched here -- the SMS sender is injected (log-stub
@@ -32,6 +34,7 @@ by default), and forecasts are read from the DB the nightly job wrote.
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,12 +48,14 @@ from sqlalchemy.exc import IntegrityError
 from service import config, db
 from service.phone import InvalidPhone, normalize_e164, region_for_station
 from service.sms import (
-    LogSmsSender, format_settings_summary, format_unsubscribe_sms,
+    BudgetedSender, LogSmsSender, format_settings_summary, format_unsubscribe_sms,
     format_verification_sms,
 )
 
 # The serviceable set and labels come from service.config -- one source of truth,
 # an explicit literal that never falls back to "every provider station".
+log = logging.getLogger("frost.api")
+
 SERVICEABLE = config.SERVICEABLE_STATIONS
 
 WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -136,7 +141,12 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         if os.environ.get("FROST_BOOTSTRAP_DB") == "1":
             db.create_all(engine)
         session_factory = db.make_session_factory(engine)
-    sender = sms_sender or LogSmsSender()
+    # A global daily send budget backstops the per-phone cooldown (which bounds the
+    # rate per number but not across numbers, so subscribe is still one SMS per
+    # distinct number). Injected senders (tests) are used as-is; the default is
+    # wrapped, so a real provider inherits the cap rather than the cap being the
+    # thing you forget to add when you swap the stub out.
+    sender = sms_sender or BudgetedSender(LogSmsSender())
 
     app = FastAPI(title="Frost Detector", docs_url="/api/docs")
 
@@ -316,8 +326,16 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
                                 format_unsubscribe_sms(config.station_label(sub.station)))
                     sub.last_sms_at = _now()
                     session.commit()
-                except Exception:  # noqa: BLE001 -- deactivation durable; SMS best-effort
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # The deactivation is durable, but the confirmation SMS -- which
+                    # IS the STOP model's authentication -- was not delivered. NOT a
+                    # silent pass: log it and PERSIST the debt so the nightly run
+                    # drains it, or an attacker + a provider blip silently un-warns a
+                    # grower (the exact outcome the design exists to prevent).
+                    log.error("unsubscribe confirmation to sub %s FAILED: %s",
+                              sub.id, exc)
+                    sub.confirm_sms_pending = True
+                    session.commit()
         return StatusOut()
 
     @app.get("/api/forecasts/{station}", response_model=list[ForecastOut])

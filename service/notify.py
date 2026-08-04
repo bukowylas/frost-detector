@@ -26,10 +26,11 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError
 
-from service import config
+from service import config, db
 from service.db import Forecast, SentNotification, StationRun, Subscriber
 from service.sms import (
     LogSmsSender, format_forecast_sms, format_no_forecast_sms,
+    format_unsubscribe_sms,
 )
 
 log = logging.getLogger("frost.notify")
@@ -118,7 +119,7 @@ def _deliver(session, sender, sub: Subscriber, claim: SentNotification, message)
         return True
     except Exception as exc:  # noqa: BLE001 -- one dead number must not abort the batch
         claim.status = "failed" if claim.attempts >= MAX_SEND_ATTEMPTS else "pending"
-        claim.last_error = f"{type(exc).__name__}: {exc}"[:256]
+        claim.last_error = f"{type(exc).__name__}: {exc}"[:db.REASON_LEN]
         session.commit()
         log.warning("send to sub %s failed (attempt %d): %s",
                     sub.id, claim.attempts, exc)
@@ -184,10 +185,12 @@ def retry_pending(session, sender=None, typical_error_c=None, now=None):
     younger than RETRY_GRACE is left alone (it may still be in flight from the
     notify pass). Returns (phone, message) re-sent.
 
-    Concurrency: on Postgres, add ``.with_for_update(skip_locked=True)`` to the
-    pending query so two retry passes (or a retry racing notify) don't both send
-    the same row -- SQLite has no row locking, so the RETRY_GRACE window is what
-    keeps the overlap from arising in the single-writer nightly design.
+    Concurrency: this loads all pending rows and filters by ``claimed_at`` in
+    Python (fine at portfolio scale; there is no query left to row-lock as written).
+    To make concurrent retry passes safe on Postgres it would need restructuring so
+    the age bound is in SQL with ``.with_for_update(skip_locked=True)`` -- not a
+    one-line change. For the single-writer nightly design the RETRY_GRACE window is
+    what keeps a retry from racing the notify pass.
     """
     sender = sender or LogSmsSender()
     now = _as_aware(now) or datetime.now(timezone.utc)
@@ -214,14 +217,45 @@ def retry_pending(session, sender=None, typical_error_c=None, now=None):
     return resent
 
 
-def notify_health(session, date):
+def drain_confirmations(session, sender=None):
+    """Re-send unsubscribe confirmations that failed at opt-out time.
+
+    ``unsubscribe`` persists ``confirm_sms_pending`` when the confirmation SMS could
+    not be sent (a provider blip). This drains that debt so the confirmation -- the
+    STOP model's authentication -- is delivered eventually, never silently dropped.
+    Returns the phones confirmed.
+    """
+    sender = sender or LogSmsSender()
+    done = []
+    owed = session.query(Subscriber).filter_by(confirm_sms_pending=True).all()
+    for sub in owed:
+        try:
+            sender.send(sub.phone, format_unsubscribe_sms(config.station_label(sub.station)))
+        except Exception as exc:  # noqa: BLE001 -- leave the debt for the next run
+            log.warning("confirmation to sub %s still failing: %s", sub.id, exc)
+            continue
+        sub.confirm_sms_pending = False
+        sub.last_sms_at = datetime.now(timezone.utc)
+        session.commit()
+        done.append(sub.phone)
+    return done
+
+
+def notify_health(session, date, stations=None):
     """A one-glance answer to "did the system do its job for ``date``?"
 
-    Distinguishes three conditions, only two of which are hard alerts, so an
-    operator is not trained to ignore the exit code:
+    Distinguishes conditions, only some of which are hard alerts, so an operator is
+    not trained to ignore the exit code:
 
-    - ``missing``  -- a serviceable station that produced NO run record at all
-                      (never ran). An alert: the job didn't run for it.
+    - ``unwarned`` -- notifications that were NOT delivered: 'failed', but ALSO
+                      'pending' and 'expired'. A night where the SMS provider was
+                      down end-to-end leaves every claim pending (one attempt < the
+                      3-attempt fail threshold), then expired 12 h later -- nobody
+                      was warned, so this MUST count, or the total-failure night
+                      reports green. An alert.
+    - ``missing``  -- a station that was expected to run but produced NO run record
+                      (never ran). An alert. ``stations`` bounds "expected" (defaults
+                      to the serviceable set) so a partial run isn't falsely missing.
     - ``failed``   -- send failures. An alert.
     - ``skips``    -- a station that ran but had no usable data. Expected and
                       documented, so a single skip is a WARNING; it becomes an
@@ -230,12 +264,16 @@ def notify_health(session, date):
     """
     import pandas as pd
     d = _as_date(date)
+    expected = set(stations) if stations is not None else set(config.SERVICEABLE_STATIONS)
     counts: dict[str, int] = {}
     for (status,) in session.query(SentNotification.status).filter_by(forecast_date=d):
         counts[status] = counts.get(status, 0) + 1
+    # Anything not 'sent' means the grower was not warned tonight.
+    unwarned = (counts.get("failed", 0) + counts.get("pending", 0)
+                + counts.get("expired", 0))
 
     ran = {r.station for r in session.query(StationRun).filter_by(date=d).all()}
-    missing = sorted(set(config.SERVICEABLE_STATIONS) - ran)
+    missing = sorted(expected - ran)
 
     skips = {r.station: r.skip_reason for r in
              session.query(StationRun).filter_by(date=d, forecast_stored=False).all()}
@@ -245,6 +283,7 @@ def notify_health(session, date):
                     session.query(StationRun).filter_by(date=prev, forecast_stored=False).all()}
     repeated_skips = sorted(s for s in skips if s in prev_skipped)
 
-    healthy = not counts.get("failed") and not missing and not repeated_skips
-    return {"date": d.isoformat(), "send_status": counts, "missing": missing,
-            "skips": skips, "repeated_skips": repeated_skips, "healthy": healthy}
+    healthy = not unwarned and not missing and not repeated_skips
+    return {"date": d.isoformat(), "send_status": counts, "unwarned": unwarned,
+            "missing": missing, "skips": skips, "repeated_skips": repeated_skips,
+            "healthy": healthy}

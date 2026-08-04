@@ -212,3 +212,19 @@ class TestPinnedOffset:
         res = nightly_job._forecast_one(
             "uk_waddington", IN_SEASON, artifact, 1.5, live_clock_check=False)
         assert res.stored is False and "lst_offset" in res.reason
+
+
+class TestFailClosedOffset:
+    def test_unknown_station_is_refused_not_waved_through(self, session, artifact,
+                                                          fake_fetch):
+        # R3: a station with no pinned offset must FAIL CLOSED (a newly-added station
+        # is exactly when the offset is most likely wrong).
+        res = nightly_job._forecast_one(
+            "uk_unknownville", IN_SEASON, artifact, 1.5, live_clock_check=False)
+        assert res.stored is False and "no pinned LST offset" in res.reason
+
+    def test_config_asserts_every_serviceable_station_is_pinned(self):
+        # The startup assertion: every serviceable station has a pinned offset.
+        from service import config
+        for st in config.SERVICEABLE_STATIONS:
+            assert st in config.EXPECTED_LST_OFFSET

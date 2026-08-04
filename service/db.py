@@ -34,7 +34,7 @@ import datetime as _dt
 
 from sqlalchemy import (
     Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text,
-    UniqueConstraint, create_engine, event, true,
+    UniqueConstraint, create_engine, event, false, true,
 )
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import (
@@ -132,6 +132,12 @@ class Subscriber(Base):
     # compiles to the right literal on both Postgres and SQLite).
     active: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true())
+    # Set when the unsubscribe confirmation SMS could not be sent (provider blip):
+    # the deactivation is durable, but the confirmation -- which IS the STOP model's
+    # authentication ("an attacker cannot silently un-warn a grower") -- is owed.
+    # The nightly run drains this, so a failed confirmation is never a silent pass.
+    confirm_sms_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)

@@ -239,3 +239,45 @@ class TestNotifyHealth:
         health = notify.notify_health(session, DAY)
         assert health["healthy"] is False
         assert "uk_cranwell" in health["repeated_skips"]
+
+
+class TestRound4:
+    def test_all_sends_pending_is_unhealthy(self, session):
+        # R2: a night where every send is still 'pending' (provider down, one
+        # attempt < the 3-attempt fail threshold) means nobody was warned -- health
+        # must NOT report green.
+        from service import config
+        _forecast(session, tmin=-1.0)
+        for st in config.SERVICEABLE_STATIONS:
+            session.add(db.StationRun(station=st, date=DAY, forecast_stored=True))
+        _sub(session, "+44700900030", mode="nightly")
+
+        class DeadSender:
+            def send(self, to, message):
+                raise RuntimeError("provider down")
+
+        notify.notify_for_date(session, DAY, sender=DeadSender())
+        assert session.query(db.SentNotification).one().status == "pending"
+        health = notify.notify_health(session, DAY)
+        assert health["unwarned"] == 1 and health["healthy"] is False
+
+    def test_drain_confirmations_resends_and_clears_flag(self, session):
+        # R1: an unsubscribe confirmation that failed at opt-out time is persisted
+        # (confirm_sms_pending) and re-sent by the drain, never silently dropped.
+        sub = db.Subscriber(station="uk_waddington", phone="+44700900031",
+                            verified=True, active=False, confirm_sms_pending=True)
+        session.add(sub)
+        session.commit()
+        sender = LogSmsSender()
+        done = notify.drain_confirmations(session, sender=sender)
+        assert done == ["+44700900031"]
+        assert len(sender.sent) == 1 and "unsubscribed" in sender.sent[0][1].lower()
+        assert session.query(db.Subscriber).one().confirm_sms_pending is False
+
+    def test_health_missing_respects_the_stations_subset(self, session):
+        # Smaller: a partial run (one station) shouldn't report the others missing.
+        session.add(db.StationRun(station="uk_waddington", date=DAY,
+                                  forecast_stored=True))
+        session.commit()
+        health = notify.notify_health(session, DAY, stations=["uk_waddington"])
+        assert health["missing"] == []

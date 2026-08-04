@@ -46,6 +46,16 @@ SERVICE_RISK_WINDOWS: list[tuple[tuple[int, int], tuple[int, int]]] = [
 # not reach into training code for it.
 RECOMMENDED_ALARM_C: float = 1.5
 
+# The LST offset (hours) each serviceable station MUST have. Pinned and asserted
+# on every nightly run -- the one guard that catches a wrong isd.lst_offset (the
+# Stage-2 timezone bug) without depending on wall clock. Every serviceable station
+# must appear here (asserted at import below), so a newly-added station can't slip
+# through with an unchecked offset. Both UK stations are UTC+0 (LST == UTC).
+EXPECTED_LST_OFFSET: dict[str, int] = {
+    "uk_waddington": 0,
+    "uk_cranwell": 0,
+}
+
 
 def station_label(station: str) -> str:
     return STATION_LABELS.get(station, station)
@@ -88,6 +98,14 @@ def _assert_config_coherent() -> None:
         raise RuntimeError(
             f"service risk windows not covered by the model: {uncovered}. The "
             "service may serve a narrower season than the model, never a wider one.")
+
+    # Every serviceable station must have a pinned LST offset, so the nightly
+    # offset guard can never fail open on a station that was added without one.
+    unpinned = [s for s in SERVICEABLE_STATIONS if s not in EXPECTED_LST_OFFSET]
+    if unpinned:
+        raise RuntimeError(
+            f"serviceable stations without a pinned LST offset: {unpinned}. Add "
+            "them to EXPECTED_LST_OFFSET -- a startup error, not a nightly skip.")
 
 
 _assert_config_coherent()

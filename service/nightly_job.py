@@ -56,14 +56,12 @@ CUTOFF_HOUR_LST = prepare.CUTOFF_HOUR   # 18:00 LST -- one source of truth
 # previous hour. (Re-measure if the serviceable set changes.)
 LIVE_CUTOFF_TOL_MIN = 40
 
-# The LST offset each serviceable station MUST have. Pinned as a constant and
-# asserted on every run (live AND backfill), because it is the one check that
-# catches a wrong isd.lst_offset -- the Stage-2 timezone bug -- without depending
-# on wall clock. The snapshot tolerance does NOT substitute: obs are continuous at
+# The pinned LST offsets live in config (asserted there to cover every serviceable
+# station), so the guard below can never fail open on a station added without one.
+# The snapshot tolerance does NOT substitute for this check: obs are continuous at
 # ~30-min intervals, so a 1-hour label shift still leaves *an* observation within
-# tolerance of the cutoff, just the wrong one, relabelled. Both UK stations are
-# UTC+0 (LST == UTC). Asserted in a unit test against isd.lst_offset.
-EXPECTED_LST_OFFSET = {"uk_waddington": 0, "uk_cranwell": 0}
+# tolerance of the cutoff, just the wrong one, relabelled.
+EXPECTED_LST_OFFSET = config.EXPECTED_LST_OFFSET
 
 
 def in_season(date) -> bool:
@@ -115,8 +113,15 @@ def _forecast_one(station, date, artifact, alarm_threshold_c,
     # score the wrong hour's data stamped as the cutoff -- exactly the divergence
     # the parity gate exists to prevent.
     from frostlib import isd
-    expected = EXPECTED_LST_OFFSET.get(station)
-    if expected is not None and isd.lst_offset(station) != expected:
+    # Fail CLOSED on an unknown station: a station missing from the pinned map is a
+    # newly-added one, which is exactly when its offset is most likely wrong, so it
+    # must be refused, not waved through. (config.py also asserts every serviceable
+    # station is pinned at import, so in practice this only fires for an ad-hoc call.)
+    if station not in EXPECTED_LST_OFFSET:
+        return StationResult(station, False,
+                             f"no pinned LST offset for {station} -- refusing")
+    expected = EXPECTED_LST_OFFSET[station]
+    if isd.lst_offset(station) != expected:
         return StationResult(
             station, False,
             f"lst_offset {isd.lst_offset(station)} != pinned {expected} for "

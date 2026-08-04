@@ -45,6 +45,39 @@ class LogSmsSender:
         log.info("SMS to %s:\n%s", to, message)
 
 
+class SmsBudgetExceeded(RuntimeError):
+    """The global daily send budget is exhausted; the send is refused."""
+
+
+class BudgetedSender:
+    """Wraps any sender with a hard GLOBAL daily send cap.
+
+    The per-phone cooldown bounds the rate to one number, but ``/api/subscribe``
+    can still issue one SMS per *distinct* number, so an attacker cycling numbers
+    is unbounded across numbers. This cap is the backstop: a fixed number of sends
+    per UTC day, refused past that. It lives at the sender so it protects EVERY
+    path, and so that swapping the log stub for a paid provider is not the step
+    that arms an unbounded-spend problem -- the budget is already there.
+    """
+
+    def __init__(self, inner, daily_limit: int = 500) -> None:
+        self._inner = inner
+        self._limit = daily_limit
+        self._day = None
+        self._count = 0
+
+    def send(self, to: str, message: str) -> None:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).date()
+        if today != self._day:
+            self._day, self._count = today, 0
+        if self._count >= self._limit:
+            raise SmsBudgetExceeded(
+                f"daily SMS budget of {self._limit} reached; refusing further sends")
+        self._inner.send(to, message)
+        self._count += 1
+
+
 def format_forecast_sms(station_label: str, date_label: str,
                         predicted_tmin_c: float, frost_likely: bool,
                         typical_error_c: float | None = None) -> str:

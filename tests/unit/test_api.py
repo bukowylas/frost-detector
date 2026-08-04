@@ -305,3 +305,17 @@ class TestAuthStateMachine:
         else:
             # absent/unverified/inactive: nothing active to change; never active+frost.
             assert not (after.active and after.mode == "frost")
+
+
+class TestSendBudget:
+    def test_budget_refuses_past_the_daily_cap(self):
+        # R4: the global daily send budget caps ALL sends, so cycling numbers can't
+        # make subscribe an unbounded SMS sender.
+        from service.sms import BudgetedSender, LogSmsSender, SmsBudgetExceeded
+        inner = LogSmsSender()
+        b = BudgetedSender(inner, daily_limit=2)
+        b.send("+447911123001", "one")
+        b.send("+447911123002", "two")
+        with pytest.raises(SmsBudgetExceeded):
+            b.send("+447911123003", "three")
+        assert len(inner.sent) == 2      # the third never reached the provider

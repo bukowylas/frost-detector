@@ -58,8 +58,10 @@ def main() -> None:
         # heartbeats a nightly subscriber -- run even when nothing stored.
         sent = notify.notify_for_date(session, date, typical_error_c=typical_error)
         resent = notify.retry_pending(session, typical_error_c=typical_error)
-        logging.info("notified %d subscriber(s); retried %d pending",
-                     len(sent), len(resent))
+        # Drain unsubscribe confirmations that failed to send at opt-out time.
+        confirmed = notify.drain_confirmations(session)
+        logging.info("notified %d; retried %d pending; drained %d unsub confirmations",
+                     len(sent), len(resent), len(confirmed))
 
     # Health: a single expected skip is a warning (logged, exit 0); a station that
     # never ran, a send failure, or a station skipping two nights running is an
@@ -71,8 +73,8 @@ def main() -> None:
     if health["healthy"]:
         logging.info("health OK for %s: %s", date, health["send_status"])
     else:
-        logging.error("UNHEALTHY %s: missing=%s failed=%s repeated_skips=%s",
-                      date, health["missing"], health["send_status"].get("failed"),
+        logging.error("UNHEALTHY %s: unwarned=%s missing=%s repeated_skips=%s",
+                      date, health["unwarned"], health["missing"],
                       health["repeated_skips"])
         raise SystemExit(1)
 
