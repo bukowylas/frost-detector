@@ -17,8 +17,8 @@ from frostlib import live, season
 
 # The stations the service forecasts for. An explicit literal -- NOT derived by
 # filtering, so it can never silently widen to "every provider station" on a
-# config mismatch. These are exactly the stations Stage 2's parity gate proved
-# reproduce the training features.
+# config mismatch. Only stations whose live feed reproduces the training features
+# (confirmed by the parity gate in tests/test_parity.py) belong here.
 SERVICEABLE_STATIONS: tuple[str, ...] = ("uk_waddington", "uk_cranwell")
 
 # Human-readable labels for the UI dropdown and the SMS messages.
@@ -47,10 +47,11 @@ SERVICE_RISK_WINDOWS: list[tuple[tuple[int, int], tuple[int, int]]] = [
 RECOMMENDED_ALARM_C: float = 1.5
 
 # The LST offset (hours) each serviceable station MUST have. Pinned and asserted
-# on every nightly run -- the one guard that catches a wrong isd.lst_offset (the
-# Stage-2 timezone bug) without depending on wall clock. Every serviceable station
-# must appear here (asserted at import below), so a newly-added station can't slip
-# through with an unchecked offset. Both UK stations are UTC+0 (LST == UTC).
+# on every nightly run -- the one guard that catches a wrong isd.lst_offset without
+# depending on wall clock (a mis-set offset would score the wrong hour's data as
+# the 18:00 cutoff). Every serviceable station must appear here (asserted at import
+# below), so a newly-added station can't slip through with an unchecked offset.
+# Both UK stations are UTC+0 (LST == UTC).
 EXPECTED_LST_OFFSET: dict[str, int] = {
     "uk_waddington": 0,
     "uk_cranwell": 0,

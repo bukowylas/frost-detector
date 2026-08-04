@@ -142,9 +142,9 @@ def _forecast_one(station, date, artifact, alarm_threshold_c,
         # Clock-sanity check: the provider's newest observation vs wall-clock LST.
         # Bounds are set from the measured ~30-min cadence: a real newest obs is
         # 0-30 min old, so [-5, 55] min admits that while catching a 1-hour offset
-        # error in BOTH signs (a +1h error makes the newest obs look future/negative;
-        # a -1h error pushes it to ~70-90 min, which the old 90-min bound let slip).
-        # The -5 lower edge tolerates a few seconds of provider/host clock skew.
+        # error in BOTH signs -- a +1h error makes the newest obs look future
+        # (negative lag), a -1h error pushes it to ~70-90 min (outside 55). The -5
+        # lower edge tolerates a few seconds of provider/host clock skew.
         if live_clock_check and not obs.empty:
             newest = pd.Timestamp(obs["lst"].max())
             lag = now_lst - newest

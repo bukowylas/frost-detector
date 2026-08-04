@@ -226,14 +226,38 @@ annoyance): each notification is claimed `pending` before the send and marked
 `nightly` subscriber whose station was skipped gets an explicit "no forecast"
 message — silence is ambiguous between "clear" and "the system is down".
 
+**Handling the parts that bite in production.** A warning system fails in ways a
+demo doesn't, so the awkward cases are handled rather than deferred:
+
+- **The message a grower receives can only change with a code.** A signup or
+  settings change is *staged*; the confirmation code activates it. So knowing a
+  phone number is not enough to alter — or silence — someone else's alerts. Codes
+  are hashed, expire, and lock after repeated wrong guesses; phone numbers are
+  normalised to E.164 so one phone is one identity; a per-phone cooldown and a
+  global daily send cap keep no endpoint an open SMS relay.
+- **Unsubscribe is the carrier STOP model.** It deactivates immediately and
+  confirms by SMS; the confirmation is the receipt, so a subscription can't be
+  silently disabled. If that confirmation can't be sent, the failure is recorded
+  and retried, not swallowed.
+- **A wrong timezone offset is caught, not trusted.** Serving the 17:00 or 19:00
+  observation as the 18:00 cutoff would produce plausible, consistently wrong
+  forecasts; a pinned per-station offset (asserted at startup) and a wall-clock
+  sanity check on the newest observation both guard against it.
+- **The nightly run reports whether it actually worked.** It records every
+  station attempt and every send outcome, and exits non-zero when a station never
+  ran, a send failed, or nobody was warned — so a silent partial failure pages
+  someone instead of passing as green.
+- **Runs on Postgres, tested on SQLite.** The schema and migrations target
+  Postgres; the offline suite runs against in-memory SQLite (with foreign-key
+  enforcement on), so a full test run needs no database and no network.
+
 **Components** (`service/`): `config.py` (the single source of truth for stations,
 labels, season, threshold), the nightly job (`nightly_job.py` — seasonal guard,
 validate-never-impute, idempotent, snapshot-time asserted, one station's failure
 never kills the night), the database (`db.py` + Alembic migrations — forecasts and
-station-runs stored richly), the API (`api.py` — FastAPI: subscribe, phone
-verification with expiring attempt-capped codes, coded unsubscribe, forecast
-reads; serves the built React UI; phones normalised to E.164), SMS
-(`sms.py`/`notify.py` — pluggable interface, log-stub default), and the React
+station-runs stored richly), the API (`api.py` — FastAPI: signup, phone
+verification, STOP-model unsubscribe, forecast reads; serves the built React UI),
+SMS (`sms.py`/`notify.py` — pluggable interface, log-stub default), and the React
 signup UI (`web/`).
 
 **Run it locally** (SQLite + log-stub SMS, no Postgres, no real texts):

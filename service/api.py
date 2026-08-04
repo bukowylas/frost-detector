@@ -120,7 +120,7 @@ class ForecastOut(BaseModel):
     alarm_fired: bool
     model_version: str
     cutoff_ts: str
-    snapshot_ts: str | None   # None on pre-Stage-7 rows
+    snapshot_ts: str | None   # None if the row predates snapshot recording
 
 
 class StationOut(BaseModel):
@@ -196,8 +196,8 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
 
     @app.post("/api/subscribe", response_model=StatusOut)
     def subscribe(body: SubscribeIn, session=Depends(get_session)):
-        # Opaque by design (A3): every path returns the same StatusOut, so the
-        # endpoint reveals nothing about whether the number is known or its state.
+        # Opaque by design: every path returns the same StatusOut, so the endpoint
+        # reveals nothing about whether the number is known or its state.
         if body.station not in SERVICEABLE:
             raise HTTPException(400, f"station {body.station!r} is not serviceable")
         try:
@@ -219,7 +219,7 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
             try:
                 session.flush()   # surface a concurrent-insert conflict now
             except IntegrityError:
-                # Another request created the row first (A5): fall through to it.
+                # Another request created the row first: fall through to it.
                 session.rollback()
                 sub = (session.query(db.Subscriber)
                        .filter_by(phone=phone, station=body.station).one())
@@ -228,7 +228,7 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         # EVERY path (new, unverified, verified, opted-out) only STAGES settings +
         # a code. Nothing that changes what the subscriber receives is applied here
         # -- verification promotes it. This is the single rule that makes the auth
-        # safe (A1 + A2).
+        # safe: an unauthenticated request cannot change a subscriber's warnings.
         code = _stage_code(existing, body.mode, body.threshold_c)
         session.commit()
         summary = format_settings_summary(config.station_label(body.station),
@@ -242,7 +242,7 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         # that promotes staged settings into effect. It always requires a fresh
         # code, so nothing a grower receives changes without one.
         #
-        # DoS note (A6): the 5-attempt lock protects the code, but on its own it is
+        # DoS note: the 5-attempt lock protects the code, but on its own it is
         # lockout-DoS-able (an attacker burns the cap so the grower's real code
         # 429s). The mitigation is a per-IP rate limit at the edge (reverse proxy /
         # slowapi) plus a global daily send budget -- deployment-layer concerns, not
@@ -307,7 +307,7 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         if sub is not None:
             was_active = sub.active
             sub.active = False
-            # Invalidate any outstanding code (A7) on ANY opt-out, active or pending:
+            # Invalidate any outstanding code on ANY opt-out, active or pending:
             # a code issued before the opt-out must not reactivate after it. Also
             # drop staged settings. Done regardless of prior active state, so opting
             # out of a still-pending subscription cancels its code too.

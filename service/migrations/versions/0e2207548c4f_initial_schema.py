@@ -64,7 +64,7 @@ def upgrade() -> None:
     sa.Column('last_sms_at', sa.DateTime(timezone=True), nullable=True),
     # true()/false() compile to `true`/`false` on Postgres and `1`/`0` on SQLite;
     # a bare text('1')/text('0') is rejected as an integer default on a Postgres
-    # boolean column (the whole point of the D1 fix).
+    # boolean column.
     sa.Column('active', sa.Boolean(), server_default=sa.true(), nullable=False),
     sa.Column('confirm_sms_pending', sa.Boolean(), server_default=sa.false(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
