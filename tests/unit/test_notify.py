@@ -16,6 +16,14 @@ from service.sms import STOP_LINE, LogSmsSender, format_forecast_sms
 DAY = dt.date(2021, 4, 15)
 
 
+def _now_utc():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _aware(d):
+    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+
+
 @pytest.fixture
 def session():
     engine = db.make_engine("sqlite://")
@@ -140,22 +148,23 @@ class TestDeliveryGuarantees:
         claim = session.query(db.SentNotification).one()
         assert claim.status == "pending" and claim.attempts == 1
 
-        # today=DAY so the (fixed test date) claim is within the retry window.
-        notify.retry_pending(session, sender=flaky, today=DAY)   # retry succeeds
+        # now = 10 min after the claim: past the 5-min grace, inside the window.
+        now = _aware(claim.claimed_at) + dt.timedelta(minutes=10)
+        notify.retry_pending(session, sender=flaky, now=now)     # retry succeeds
         session.refresh(claim)
         assert claim.status == "sent" and flaky.calls == 2
 
     def test_stale_pending_claim_is_expired_not_resent(self, session):
-        # A claim left pending for an old night must never be re-sent -- a stale
-        # frost warning is actively misleading.
+        # A claim older than the retry WINDOW (by age, not date) must never be
+        # re-sent -- a stale frost warning is actively misleading.
         _forecast(session, tmin=-1.0)
         _sub(session, "+44700900013", mode="nightly")
+        old = _now_utc() - dt.timedelta(days=2)
         session.add(db.SentNotification(subscriber_id=1, forecast_date=DAY,
-                                        status="pending", attempts=1))
+                                        status="pending", attempts=1, claimed_at=old))
         session.commit()
         sender = LogSmsSender()
-        # "today" is far after DAY -> the claim is outside the retry window.
-        notify.retry_pending(session, sender=sender, today=dt.date(2026, 4, 15))
+        notify.retry_pending(session, sender=sender)
         assert sender.sent == []
         assert session.query(db.SentNotification).one().status == "expired"
 
@@ -177,17 +186,56 @@ class TestDeliveryGuarantees:
 
 
 class TestNotifyHealth:
-    def test_healthy_when_all_sent_and_no_skips(self, session):
+    def _run_all_serviceable(self, session, stored=True, reason=None):
+        # A run record for EVERY serviceable station, so 'missing' is empty.
+        from service import config
+        for st in config.SERVICEABLE_STATIONS:
+            session.add(db.StationRun(station=st, date=DAY, forecast_stored=stored,
+                                      skip_reason=reason))
+        session.commit()
+
+    def test_healthy_when_all_ran_sent_and_no_repeat_skips(self, session):
         _forecast(session, tmin=-1.0)
-        _run(session)
+        self._run_all_serviceable(session)
         _sub(session, "+44700900020", mode="nightly")
         notify.notify_for_date(session, DAY)
         health = notify.notify_health(session, DAY)
         assert health["healthy"] is True
         assert health["send_status"].get("sent") == 1
+        assert health["missing"] == []
 
-    def test_unhealthy_when_a_station_skipped(self, session):
-        _run(session, stored=False, reason="provider unreachable")
+    def test_a_station_that_never_ran_is_unhealthy(self, session):
+        # Only one of two serviceable stations produced a run record -> the other
+        # is 'missing' (never ran), which is a hard alert.
+        session.add(db.StationRun(station="uk_waddington", date=DAY,
+                                  forecast_stored=True))
+        session.commit()
         health = notify.notify_health(session, DAY)
         assert health["healthy"] is False
-        assert health["skips"] == [("uk_waddington", "provider unreachable")]
+        assert "uk_cranwell" in health["missing"]
+
+    def test_single_skip_is_a_warning_not_an_alert(self, session):
+        # Both ran; one skipped once (no skip the night before) -> healthy (warning).
+        self._run_all_serviceable(session)
+        run = session.query(db.StationRun).filter_by(station="uk_cranwell").one()
+        run.forecast_stored = False
+        run.skip_reason = "provider unreachable"
+        session.commit()
+        health = notify.notify_health(session, DAY)
+        assert health["healthy"] is True                 # single skip: warn, not alert
+        assert "uk_cranwell" in health["skips"]
+        assert health["repeated_skips"] == []
+
+    def test_two_consecutive_skips_is_an_alert(self, session):
+        self._run_all_serviceable(session)
+        prev = DAY - dt.timedelta(days=1)
+        for st in ("uk_waddington", "uk_cranwell"):
+            session.add(db.StationRun(station=st, date=prev, forecast_stored=False,
+                                      skip_reason="down"))
+        run = session.query(db.StationRun).filter_by(station="uk_cranwell", date=DAY).one()
+        run.forecast_stored = False
+        run.skip_reason = "down again"
+        session.commit()
+        health = notify.notify_health(session, DAY)
+        assert health["healthy"] is False
+        assert "uk_cranwell" in health["repeated_skips"]

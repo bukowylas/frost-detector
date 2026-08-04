@@ -29,13 +29,16 @@ def ctx():
 
 
 def _last_code(sender):
+    # SMS is "Frost Detector code NNNNNN -- confirms: ..."; pull the first 6 digits.
     _, msg = sender.sent[-1]
-    return "".join(ch for ch in msg.split("code is")[1][:8] if ch.isdigit())
+    import re
+    return re.search(r"\b(\d{6})\b", msg).group(1)
 
 
-def _subscribe(client, phone="+447911123001", station="uk_waddington", mode="nightly"):
-    return client.post("/api/subscribe",
-                       json={"station": station, "phone": phone, "mode": mode})
+def _subscribe(client, phone="+447911123001", station="uk_waddington",
+               mode="nightly", threshold_c=0.0):
+    return client.post("/api/subscribe", json={
+        "station": station, "phone": phone, "mode": mode, "threshold_c": threshold_c})
 
 
 class TestStations:
@@ -46,19 +49,24 @@ class TestStations:
 
 
 class TestSubscribeVerifyFlow:
-    def test_subscribe_creates_unverified_and_sends_a_code(self, ctx):
+    def test_subscribe_is_opaque_and_sends_a_code_naming_the_settings(self, ctx):
         client, _, sender = ctx
-        r = _subscribe(client)
-        assert r.status_code == 200 and r.json()["verified"] is False
+        r = _subscribe(client, mode="frost", threshold_c=-2.0)
+        # Opaque response (no id/verified oracle); a code SMS that names the settings.
+        assert r.status_code == 200 and r.json() == {"status": "ok"}
         assert len(sender.sent) == 1
+        assert "-2.0" in sender.sent[-1][1] and "frost" in sender.sent[-1][1]
 
-    def test_verify_with_correct_code_activates(self, ctx):
-        client, _, sender = ctx
-        _subscribe(client, phone="+447911123002")
+    def test_verify_with_correct_code_activates_and_promotes_settings(self, ctx):
+        client, factory, sender = ctx
+        _subscribe(client, phone="+447911123002", mode="frost", threshold_c=-2.0)
         code = _last_code(sender)
         r = client.post("/api/verify", json={
             "phone": "+447911123002", "station": "uk_waddington", "code": code})
         assert r.status_code == 200 and r.json()["verified"] is True
+        sub = factory().query(db.Subscriber).one()
+        # Settings only take effect on verify (staged until then).
+        assert sub.mode == "frost" and sub.threshold_c == -2.0 and sub.active is True
 
     def test_verify_with_wrong_code_is_rejected(self, ctx):
         client, _, _ = ctx
@@ -113,67 +121,122 @@ class TestPhoneNormalisation:
         # +44..., 0044..., and 07... national are the same UK phone.
         for p in ("+447911123123", "00447911123123", "07911123123"):
             _subscribe(client, phone=p)
+            _cool_off(factory, "+447911123123")   # per-phone cooldown between tries
         assert factory().query(db.Subscriber).count() == 1
 
 
-def _verify(client, sender, phone, station="uk_waddington"):
-    _subscribe(client, phone=phone, station=station)
+class TestNoEnumeration:
+    def test_subscribe_response_is_opaque(self, ctx):
+        # A3: subscribe reveals nothing -- same body for a new number, an existing
+        # verified one, and an unserviceable-but-valid state is a 400 (not an oracle).
+        client, factory, sender = ctx
+        r1 = _subscribe(client, phone="+447911123401")
+        _verify(client, factory, sender, "+447911123402")
+        r2 = _subscribe(client, phone="+447911123402")   # already verified
+        assert r1.json() == r2.json() == {"status": "ok"}
+        assert "id" not in r1.json() and "verified" not in r1.json()
+
+
+class TestCooldown:
+    def test_first_contact_then_cooldown_blocks_a_second_code(self, ctx):
+        # A4: even a first contact is throttled once a row exists; a second request
+        # to the same phone within the window is 429, regardless of station.
+        client, _, _ = ctx
+        assert _subscribe(client, phone="+447911123501").status_code == 200
+        r = _subscribe(client, phone="+447911123501", station="uk_cranwell")
+        assert r.status_code == 429      # per-PHONE, so a different station is still blocked
+
+
+def _cool_off(factory, phone):
+    """Simulate the per-phone cooldown elapsing, so a test can make a second
+    request to the same phone without a 429."""
+    s = factory()
+    for sub in s.query(db.Subscriber).filter_by(phone=phone).all():
+        sub.last_sms_at = None
+    s.commit()
+
+
+def _verify(client, factory, sender, phone, station="uk_waddington",
+            mode="nightly", threshold_c=0.0):
+    _subscribe(client, phone=phone, station=station, mode=mode, threshold_c=threshold_c)
     code = _last_code(sender)
     client.post("/api/verify", json={"phone": phone, "station": station, "code": code})
+    _cool_off(factory, phone)
 
 
-class TestNoSilentUnverify:
-    def test_verified_settings_change_stays_verified_and_announces(self, ctx):
+class TestStagedSettings:
+    def test_pending_subscribe_does_not_apply_settings(self, ctx):
+        # A1: a subscribe on an unverified row must NOT change the active settings.
         client, factory, sender = ctx
-        _verify(client, sender, "+447911123201")
-        before = len(sender.sent)
-        # Change settings on a verified row -- stays verified/active, and a
-        # confirmation SMS is sent (so an unauthorised change is self-reporting).
-        r = client.post("/api/subscribe", json={"station": "uk_waddington",
-                        "phone": "+447911123201", "mode": "frost", "threshold_c": -1.0})
-        assert r.json()["verified"] is True
+        _subscribe(client, phone="+447911123201", mode="nightly")
+        _cool_off(factory, "+447911123201")
+        _subscribe(client, phone="+447911123201", mode="frost", threshold_c=-10.0)
         sub = factory().query(db.Subscriber).one()
-        assert sub.verified is True and sub.mode == "frost" and sub.active is True
-        assert len(sender.sent) == before + 1
-        assert "changed" in sender.sent[-1][1]      # a settings-changed SMS, not a code
+        # Nothing applied: still unverified, and the poison threshold is only staged.
+        assert sub.verified is False
+        assert sub.mode == "nightly"                 # active, unchanged
+        assert sub.pending_threshold_c == -10.0      # staged, pending a code
+
+    def test_verified_settings_change_requires_the_code(self, ctx):
+        # A2: changing settings on a verified row stages them; they take effect only
+        # after the fresh code is verified (no unauthenticated write).
+        client, factory, sender = ctx
+        _verify(client, factory, sender, "+447911123202", mode="nightly")
+        client.post("/api/subscribe", json={"station": "uk_waddington",
+                    "phone": "+447911123202", "mode": "frost", "threshold_c": -1.0})
+        sub = factory().query(db.Subscriber).one()
+        assert sub.mode == "nightly"                 # NOT yet applied
+        assert sub.pending_mode == "frost"           # staged
+        code = _last_code(sender)
+        client.post("/api/verify", json={"phone": "+447911123202",
+                    "station": "uk_waddington", "code": code})
+        sub = factory().query(db.Subscriber).one()
+        assert sub.mode == "frost" and sub.threshold_c == -1.0   # promoted on verify
 
     def test_opted_out_row_is_not_reactivated_without_a_code(self, ctx):
         client, factory, sender = ctx
-        _verify(client, sender, "+447911123202")
-        client.post("/api/unsubscribe", json={"phone": "+447911123202",
+        _verify(client, factory, sender, "+447911123203")
+        client.post("/api/unsubscribe", json={"phone": "+447911123203",
                     "station": "uk_waddington"})
         assert factory().query(db.Subscriber).one().active is False
-        # A plain subscribe must NOT silently switch them back on -- it re-enters
-        # the pending flow (unverified), requiring a fresh code to reactivate.
-        r = client.post("/api/subscribe", json={"station": "uk_waddington",
-                        "phone": "+447911123202", "mode": "nightly"})
-        # Re-enters pending: unverified, and NOT reactivated -- verify (with a fresh
-        # code) is the only path back to active, so an opted-out number can't be
-        # switched on by an unauthenticated POST.
-        assert r.json()["verified"] is False
-        sub = factory().query(db.Subscriber).one()
-        assert sub.verified is False and sub.active is False
+        _cool_off(factory, "+447911123203")
+        # A plain subscribe stages a code but does NOT reactivate.
+        client.post("/api/subscribe", json={"station": "uk_waddington",
+                    "phone": "+447911123203", "mode": "nightly"})
+        assert factory().query(db.Subscriber).one().active is False   # still opted out
 
 
 class TestUnsubscribe:
     def test_unsubscribe_deactivates_immediately_and_confirms(self, ctx):
         client, factory, sender = ctx
-        _verify(client, sender, "+447911123301")
+        _verify(client, factory, sender, "+447911123301")
         before = len(sender.sent)
         r = client.post("/api/unsubscribe", json={
             "phone": "+447911123301", "station": "uk_waddington"})
-        assert r.status_code == 200
+        assert r.status_code == 200 and r.json() == {"status": "ok"}
         sub = factory().query(db.Subscriber).one()
         assert sub.active is False and sub.unsubscribed_at is not None
         assert len(sender.sent) == before + 1
         assert "unsubscribed" in sender.sent[-1][1].lower()
+
+    def test_unsubscribe_invalidates_an_outstanding_code(self, ctx):
+        # A7: a code issued before opt-out must not reactivate after it.
+        client, factory, sender = ctx
+        _subscribe(client, phone="+447911123302")   # issues a code, row inactive
+        code = _last_code(sender)
+        client.post("/api/unsubscribe", json={"phone": "+447911123302",
+                    "station": "uk_waddington"})
+        r = client.post("/api/verify", json={"phone": "+447911123302",
+                        "station": "uk_waddington", "code": code})
+        assert r.status_code == 400            # the code was invalidated by opt-out
+        assert factory().query(db.Subscriber).one().active is False
 
     def test_unsubscribe_does_not_enumerate(self, ctx):
         client, _, sender = ctx
         before = len(sender.sent)
         r = client.post("/api/unsubscribe", json={
             "phone": "+447911123999", "station": "uk_waddington"})
-        assert r.status_code == 200            # same response whether or not it exists
+        assert r.status_code == 200 and r.json() == {"status": "ok"}
         assert len(sender.sent) == before      # and no SMS sent to a non-subscriber
 
 
@@ -195,3 +258,50 @@ class TestForecastRead:
         client, _, _ = ctx
         r = client.get("/api/forecasts/uk_waddington?limit=9999")
         assert r.status_code == 200      # clamped, not rejected
+
+
+class TestAuthStateMachine:
+    """The invariant that no round has tested: mode/threshold_c never change to
+    unauthenticated values. Table over the (state x action) transitions, asserting
+    the active settings only ever equal the LAST VERIFIED values."""
+
+    def _make(self, client, factory, sender, phone, state):
+        """Put a (phone, station) row into the requested state."""
+        if state == "absent":
+            return
+        _subscribe(client, phone=phone, mode="nightly", threshold_c=0.0)
+        if state == "unverified":
+            return
+        code = _last_code(sender)
+        client.post("/api/verify", json={"phone": phone,
+                    "station": "uk_waddington", "code": code})
+        _cool_off(factory, phone)
+        if state == "inactive":
+            client.post("/api/unsubscribe", json={"phone": phone,
+                        "station": "uk_waddington"})
+            _cool_off(factory, phone)
+
+    @pytest.mark.parametrize("state", ["absent", "unverified", "verified", "inactive"])
+    def test_subscribe_never_changes_active_settings_unauthenticated(
+            self, ctx, state):
+        client, factory, sender = ctx
+        phone = "+447911123" + {"absent": "601", "unverified": "602",
+                                "verified": "603", "inactive": "604"}[state]
+        self._make(client, factory, sender, phone, state)
+        _cool_off(factory, phone)
+
+        before = factory().query(db.Subscriber).filter_by(phone=phone).one_or_none()
+        before_mode = before.mode if before else None
+
+        # Attempt to poison via an unauthenticated subscribe.
+        client.post("/api/subscribe", json={"station": "uk_waddington",
+                    "phone": phone, "mode": "frost", "threshold_c": -10.0})
+
+        after = factory().query(db.Subscriber).filter_by(phone=phone).one()
+        if state in ("verified",):
+            # active settings unchanged (still the verified values); poison is staged.
+            assert after.mode == before_mode == "nightly"
+            assert after.pending_threshold_c == -10.0
+        else:
+            # absent/unverified/inactive: nothing active to change; never active+frost.
+            assert not (after.active and after.mode == "frost")

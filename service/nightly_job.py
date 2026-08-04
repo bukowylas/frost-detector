@@ -41,7 +41,7 @@ import pandas as pd
 
 import prepare
 from frostlib import live, model_io
-from service import config
+from service import config, db
 from service.db import Forecast, StationRun
 
 log = logging.getLogger("frost.nightly")
@@ -55,6 +55,15 @@ CUTOFF_HOUR_LST = prepare.CUTOFF_HOUR   # 18:00 LST -- one source of truth
 # near the cutoff, so 40 admits the normal gap while rejecting a snapshot from the
 # previous hour. (Re-measure if the serviceable set changes.)
 LIVE_CUTOFF_TOL_MIN = 40
+
+# The LST offset each serviceable station MUST have. Pinned as a constant and
+# asserted on every run (live AND backfill), because it is the one check that
+# catches a wrong isd.lst_offset -- the Stage-2 timezone bug -- without depending
+# on wall clock. The snapshot tolerance does NOT substitute: obs are continuous at
+# ~30-min intervals, so a 1-hour label shift still leaves *an* observation within
+# tolerance of the cutoff, just the wrong one, relabelled. Both UK stations are
+# UTC+0 (LST == UTC). Asserted in a unit test against isd.lst_offset.
+EXPECTED_LST_OFFSET = {"uk_waddington": 0, "uk_cranwell": 0}
 
 
 def in_season(date) -> bool:
@@ -100,6 +109,19 @@ def _forecast_one(station, date, artifact, alarm_threshold_c,
     """
     cutoff = pd.Timestamp(date) + pd.Timedelta(hours=CUTOFF_HOUR_LST)
 
+    # Pinned-offset check (runs in BOTH live and backfill modes, no wall clock):
+    # the one guard that catches a wrong isd.lst_offset even for a backfill, where
+    # the wall-clock checks below don't apply. A mis-set offset would silently
+    # score the wrong hour's data stamped as the cutoff -- exactly the divergence
+    # the parity gate exists to prevent.
+    from frostlib import isd
+    expected = EXPECTED_LST_OFFSET.get(station)
+    if expected is not None and isd.lst_offset(station) != expected:
+        return StationResult(
+            station, False,
+            f"lst_offset {isd.lst_offset(station)} != pinned {expected} for "
+            f"{station} -- timezone/config error")
+
     # Refuse to forecast an evening that has not reached its cutoff yet -- there is
     # no 18:00 observation to use, so any snapshot would be from earlier and
     # warm-biased.
@@ -112,17 +134,16 @@ def _forecast_one(station, date, artifact, alarm_threshold_c,
     try:
         obs = live.fetch_window(station, cutoff)
 
-        # Clock-sanity check: compare the provider's newest observation against
-        # wall-clock LST. This is the ONE check that catches a wrong isd.lst_offset
-        # (the Stage-2 timezone bug) -- an offset error desynchronises the two: a
-        # +1h error puts the newest obs in the future (negative lag), a -1h error
-        # makes it look staler than any real reporting cadence. (The snapshot-hour
-        # check below cannot catch this, because it reads the same mis-stamped
-        # times as the cutoff comparison.)
+        # Clock-sanity check: the provider's newest observation vs wall-clock LST.
+        # Bounds are set from the measured ~30-min cadence: a real newest obs is
+        # 0-30 min old, so [-5, 55] min admits that while catching a 1-hour offset
+        # error in BOTH signs (a +1h error makes the newest obs look future/negative;
+        # a -1h error pushes it to ~70-90 min, which the old 90-min bound let slip).
+        # The -5 lower edge tolerates a few seconds of provider/host clock skew.
         if live_clock_check and not obs.empty:
             newest = pd.Timestamp(obs["lst"].max())
             lag = now_lst - newest
-            if not (pd.Timedelta(0) <= lag <= pd.Timedelta(minutes=90)):
+            if not (pd.Timedelta(minutes=-5) <= lag <= pd.Timedelta(minutes=55)):
                 return StationResult(
                     station, False,
                     f"newest obs {newest} is {lag} from now ({now_lst} LST) -- "
@@ -145,6 +166,8 @@ def _forecast_one(station, date, artifact, alarm_threshold_c,
                 station, False,
                 f"snapshot hour {snap.hour} LST outside the cutoff window")
 
+        # artifact.predict selects its own feature columns by name (so the extra
+        # snapshot_ts/month keys in feats are dropped); pass the frame as-is.
         tmin = float(artifact.predict(pd.DataFrame([feats]))[0])
     except live.OgimetError as exc:
         return StationResult(station, False, f"provider declined: {exc}")
@@ -190,7 +213,7 @@ def _record_run(session, station, date, result):
     existing = (session.query(StationRun)
                 .filter_by(station=station, date=d).one_or_none())
     payload = dict(forecast_stored=result.stored,
-                   skip_reason=None if result.stored else result.reason)
+                   skip_reason=None if result.stored else result.reason[:db.REASON_LEN])
     if existing is None:
         session.add(StationRun(station=station, date=d, **payload))
     else:
@@ -220,17 +243,20 @@ def run(session, dates=None, stations=None, alarm_threshold_c=None,
         artifact = model_io.load_model(expected_features=FEATURES)
     if alarm_threshold_c is None:
         alarm_threshold_c = config.RECOMMENDED_ALARM_C
-    if dates is None:
-        dates = [pd.Timestamp.now().normalize().date()]
     if stations is None:
         stations = list(config.SERVICEABLE_STATIONS)
+    # A default "today" is the evening date in the STATION's Local Standard Time,
+    # not the host's -- resolved per station inside the loop (each station's LST
+    # can differ). An explicit dates= is used as given.
+    explicit_dates = dates is not None
 
     results: list[StationResult] = []
-    for date in dates:
-        if not in_season(date):
-            log.info("out of season (%s); skipping", date)
-            continue
-        for station in stations:
+    for station in stations:
+        station_dates = dates if explicit_dates else [_now_lst(station).date()]
+        for date in station_dates:
+            if not in_season(date):
+                log.info("%s out of season (%s); skipping", station, date)
+                continue
             res = _forecast_one(station, date, artifact, alarm_threshold_c,
                                 now_lst=now_lst, live_clock_check=live_clock_check)
             if res.stored:

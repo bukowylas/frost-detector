@@ -192,3 +192,23 @@ class TestStationRuns:
                         artifact=artifact)
         run = session.query(db.StationRun).one()
         assert run.forecast_stored is False and "declined" in run.skip_reason
+
+
+class TestPinnedOffset:
+    def test_pinned_offset_matches_isd(self):
+        # T2: the pinned EXPECTED_LST_OFFSET must equal what isd.lst_offset returns,
+        # or the guard would false-reject every real run. This is the assertion that
+        # keeps the pin honest.
+        from frostlib import isd
+        for station, off in nightly_job.EXPECTED_LST_OFFSET.items():
+            assert isd.lst_offset(station) == off
+
+    def test_wrong_offset_is_rejected_in_backfill_too(self, session, artifact,
+                                                      fake_fetch, monkeypatch):
+        # The pinned-offset check runs in BOTH modes -- a mistimed clock is caught
+        # even when the wall-clock guards are off (backfill).
+        from frostlib import isd
+        monkeypatch.setattr(isd, "lst_offset", lambda s: 1)   # wrong for a UK station
+        res = nightly_job._forecast_one(
+            "uk_waddington", IN_SEASON, artifact, 1.5, live_clock_check=False)
+        assert res.stored is False and "lst_offset" in res.reason

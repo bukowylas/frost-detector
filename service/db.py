@@ -34,7 +34,7 @@ import datetime as _dt
 
 from sqlalchemy import (
     Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text,
-    UniqueConstraint, create_engine, text,
+    UniqueConstraint, create_engine, event, true,
 )
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import (
@@ -42,6 +42,9 @@ from sqlalchemy.orm import (
 )
 
 DEFAULT_SQLITE_URL = "sqlite:///./frost_service.db"
+
+# Max length for a stored free-text reason/error; writers truncate to this.
+REASON_LEN = 256
 
 
 def database_url() -> str:
@@ -98,29 +101,37 @@ class Subscriber(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     station: Mapped[str] = mapped_column(String(64), index=True)
     phone: Mapped[str] = mapped_column(String(32), index=True)
-    # "nightly" = a message every night (the heartbeat); "frost" = only when the
-    # forecast is at/below the subscriber's threshold.
+    # The ACTIVE (last-authenticated) settings the notify step reads. These are
+    # NEVER written by an unauthenticated request -- only promoted from pending_*
+    # when a fresh code is verified. "nightly" = a message every night (the
+    # heartbeat); "frost" = only when the forecast is at/below the threshold.
     mode: Mapped[str] = mapped_column(String(16), default="nightly")
     threshold_c: Mapped[float] = mapped_column(Float, default=0.0)
+    # STAGED settings from a subscribe request, not yet authenticated. A subscribe
+    # writes here; verify promotes them into mode/threshold_c on a correct code.
+    # This is the single rule that makes the auth safe: nothing that changes what a
+    # subscriber receives takes effect without a fresh code.
+    pending_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    pending_threshold_c: Mapped[float | None] = mapped_column(Float, nullable=True)
     verified: Mapped[bool] = mapped_column(Boolean, default=False)
     # The verification code is stored HASHED (never plaintext), with an attempt
     # counter and an expiry so it cannot be brute-forced or replayed indefinitely.
     verify_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     verify_attempts: Mapped[int] = mapped_column(Integer, default=0)
-    # Stored directly (not reconstructed from the expiry) so a change to the code
-    # TTL cannot silently misread historical rows when computing the cooldown.
-    verify_code_issued_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True)
     verify_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
+    # When an SMS was last sent to this phone -- the per-phone cooldown clock. Set
+    # only AFTER a successful send, so a failed send does not burn the cooldown and
+    # mislead the user with "code recently sent".
+    last_sms_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     # Soft-delete: unsubscribing sets active=False rather than deleting the row, so
-    # the send audit trail survives and a same-night re-subscribe reuses the row
-    # (no duplicate text under a fresh id). server_default so a migration adding
-    # this column to an existing table leaves every current subscriber ACTIVE --
-    # without it the ALTER would default them to inactive, a fleet-wide silent
-    # denial of warning delivered by the migration itself.
+    # the send audit trail survives and a same-night re-subscribe reuses the row.
+    # server_default=true() so a migration adding this column leaves every existing
+    # subscriber ACTIVE (a bare "1" is invalid for a Postgres boolean; true()
+    # compiles to the right literal on both Postgres and SQLite).
     active: Mapped[bool] = mapped_column(
-        Boolean, default=True, server_default=text("1"))
+        Boolean, default=True, server_default=true())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
@@ -139,11 +150,13 @@ class SentNotification(Base):
 
     The uniqueness constraint on (subscriber, date) makes the claim idempotent: a
     concurrent or repeat attempt violates it, so a night is claimed once. ``status``
-    then tracks delivery: a row is inserted 'pending' and committed BEFORE the send,
-    so a crash cannot lose the claim; on success it becomes 'sent', on failure the
-    attempt count rises and a retry pass can pick it up. This is at-least-once with
-    bounded duplicates -- the right semantics for a warning system, where a dropped
-    frost message costs a crop and a duplicate costs a mild annoyance.
+    tracks delivery: a row is inserted 'pending' and committed BEFORE the send, so a
+    crash cannot lose the claim; on success it becomes 'sent'; on failure the attempt
+    count rises and a retry pass picks it up; a claim past the retry window becomes
+    'expired' and is never sent (a stale warning is worse than a drop). This is
+    at-least-once with bounded duplicates -- the right semantics for a warning
+    system, where a dropped frost message costs a crop and a duplicate costs a mild
+    annoyance.
     """
 
     __tablename__ = "sent_notifications"
@@ -152,9 +165,13 @@ class SentNotification(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id"), index=True)
+    # ondelete=RESTRICT (declared, not accidental): a hard delete of a subscriber
+    # is refused at the DB so the send audit trail cannot be silently orphaned.
+    subscriber_id: Mapped[int] = mapped_column(
+        ForeignKey("subscribers.id", ondelete="RESTRICT"), index=True)
     forecast_date: Mapped[_dt.date] = mapped_column(Date)
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|sent|failed
+    # pending -> sent | failed | expired (a stale claim past the retry window).
+    status: Mapped[str] = mapped_column(String(16), default="pending")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(String(256), nullable=True)
     claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -181,7 +198,10 @@ class StationRun(Base):
     station: Mapped[str] = mapped_column(String(64), index=True)
     date: Mapped[_dt.date] = mapped_column(Date, index=True)
     forecast_stored: Mapped[bool] = mapped_column(Boolean)
-    skip_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Truncate at the write boundary (see nightly_job): an unbounded exception
+    # string would overflow this on Postgres, and the failure-recording path must
+    # not itself fail.
+    skip_reason: Mapped[str | None] = mapped_column(String(REASON_LEN), nullable=True)
     ran_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -202,7 +222,19 @@ def make_engine(url: str | None = None, echo: bool = False):
     kwargs = {"connect_args": {"check_same_thread": False}}
     if url in ("sqlite://", "sqlite:///:memory:"):
         kwargs["poolclass"] = StaticPool
-    return create_engine(url, echo=echo, future=True, **kwargs)
+    engine = create_engine(url, echo=echo, future=True, **kwargs)
+
+    # SQLite disables foreign keys by default, so ondelete=RESTRICT would not be
+    # enforced and a test asserting "a hard delete is refused" would pass for the
+    # wrong reason. Turn FK enforcement on per connection so tests exercise the
+    # real (Postgres-like) behaviour.
+    @event.listens_for(engine, "connect")
+    def _fk_pragma(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.close()
+
+    return engine
 
 
 def make_session_factory(engine):

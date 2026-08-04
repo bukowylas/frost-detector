@@ -21,10 +21,16 @@ class TestPhoneNormalisation:
     def test_polish_national_uses_pl_region(self):
         assert normalize_e164("601234567", region="PL") == "+48601234567"
 
-    def test_landline_is_rejected(self):
-        # A UK landline (020 = London) cannot receive SMS -> caught at signup.
+    @pytest.mark.parametrize("raw", [
+        "02079460958",     # London landline
+        "09001234567",     # premium rate (billable to us)
+        "03001234567",     # UAN (03xx) -- not SMS-capable
+    ])
+    def test_non_mobile_numbers_are_rejected(self, raw):
+        # Only SMS-capable (mobile) numbers pass -- texting these fails silently or
+        # bills us, so they're caught at signup, not at 2am on a frost night.
         with pytest.raises(InvalidPhone):
-            normalize_e164("02079460958", "GB")
+            normalize_e164(raw, "GB")
 
     @pytest.mark.parametrize("bad", ["", "hello", "12345", "+++"])
     def test_unparseable_or_invalid_raises(self, bad):
@@ -34,6 +40,12 @@ class TestPhoneNormalisation:
     def test_region_derived_from_station_key(self):
         assert region_for_station("uk_waddington") == "GB"
         assert region_for_station("pl_lublinek_lodz") == "PL"
+
+    def test_unknown_station_prefix_fails_closed(self):
+        # P2: an unconfigured region raises rather than silently defaulting to GB
+        # (which could misroute a foreign number to the wrong country).
+        with pytest.raises(InvalidPhone):
+            region_for_station("no_oslo")
 
 
 class TestServiceConfig:

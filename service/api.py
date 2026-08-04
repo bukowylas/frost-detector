@@ -39,11 +39,13 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from service import config, db
 from service.phone import InvalidPhone, normalize_e164, region_for_station
 from service.sms import (
-    LogSmsSender, format_settings_changed_sms, format_unsubscribe_sms,
+    LogSmsSender, format_settings_summary, format_unsubscribe_sms,
     format_verification_sms,
 )
 
@@ -83,9 +85,14 @@ class SubscribeIn(BaseModel):
     threshold_c: float = Field(default=0.0, ge=-10.0, le=5.0)
 
 
-class SubscribeOut(BaseModel):
-    id: int
-    station: str
+class StatusOut(BaseModel):
+    # Deliberately opaque: subscribe returns this regardless of whether the phone
+    # was known, its verification state, or its PK -- so the endpoint cannot be
+    # used to enumerate subscribers or their state.
+    status: str = "ok"
+
+
+class VerifyOut(BaseModel):
     verified: bool
 
 
@@ -140,33 +147,47 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         finally:
             s.close()
 
-    def _issue_code(sub) -> str:
-        """Issue a fresh code on ``sub``; returns the plaintext to send once.
-
-        The DB only ever holds the hash; the caller sends the returned plaintext
-        after the commit. ``verify_code_issued_at`` is stored directly rather than
-        reconstructed from the expiry, so a change to CODE_TTL cannot silently
-        misread historical rows."""
+    def _stage_code(sub, mode, threshold_c) -> str:
+        """Stage requested settings and a fresh code on ``sub`` WITHOUT touching the
+        active mode/threshold_c. Returns the plaintext code to send once (the DB
+        only holds the hash). The staged settings are promoted only when the code
+        is verified -- so an unauthenticated request can never change what a
+        subscriber receives."""
+        sub.pending_mode = mode
+        sub.pending_threshold_c = threshold_c
         code = f"{secrets.randbelow(1_000_000):06d}"
         sub.verify_code_hash = _hash_code(code)
         sub.verify_attempts = 0
-        now = _now()
-        sub.verify_code_issued_at = now
-        sub.verify_expires_at = now + CODE_TTL
+        sub.verify_expires_at = _now() + CODE_TTL
         return code
 
-    def _send_or_503(sndr, to, message):
+    def _phone_cooled_down(session, phone) -> bool:
+        """True if an SMS was sent to THIS PHONE (any station) within the cooldown.
+        Keyed on the phone, not (phone, station), so N stations can't multiply the
+        rate and a first-contact number is still governed once a row exists."""
+        last = (session.query(func.max(db.Subscriber.last_sms_at))
+                .filter(db.Subscriber.phone == phone).scalar())
+        last = _as_aware(last)
+        return last is not None and last + SUBSCRIBE_COOLDOWN > _now()
+
+    def _send_and_mark(session, sub, phone, message):
+        """Send, then record last_sms_at only on success -- a failed send must not
+        burn the cooldown (which would mislead 'code recently sent')."""
         try:
-            sndr.send(to, message)
-        except Exception:  # noqa: BLE001 -- state is committed; a resend recovers it
+            sender.send(phone, message)
+        except Exception:  # noqa: BLE001 -- staged state is committed; a resend recovers it
             raise HTTPException(503, "could not send an SMS; please try again")
+        sub.last_sms_at = _now()
+        session.commit()
 
     @app.get("/api/stations", response_model=list[StationOut])
     def stations():
         return [StationOut(key=k, label=config.station_label(k)) for k in SERVICEABLE]
 
-    @app.post("/api/subscribe", response_model=SubscribeOut)
+    @app.post("/api/subscribe", response_model=StatusOut)
     def subscribe(body: SubscribeIn, session=Depends(get_session)):
+        # Opaque by design (A3): every path returns the same StatusOut, so the
+        # endpoint reveals nothing about whether the number is known or its state.
         if body.station not in SERVICEABLE:
             raise HTTPException(400, f"station {body.station!r} is not serviceable")
         try:
@@ -174,66 +195,56 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         except InvalidPhone as exc:
             raise HTTPException(422, f"invalid phone: {exc}")
 
+        # One 429 string regardless of state, so a cooled-down response is not an
+        # oracle for whether the number is subscribed.
+        if _phone_cooled_down(session, phone):
+            raise HTTPException(429, "please wait before requesting another code")
+
         existing = (session.query(db.Subscriber)
                     .filter_by(phone=phone, station=body.station).one_or_none())
-
-        # A per-phone cooldown throttles code/SMS issue on ANY path (verified or
-        # not), so no endpoint is an unthrottled SMS sender pointed at a phone.
-        def _cooled_down(sub):
-            issued = _as_aware(sub.verify_code_issued_at) if sub else None
-            return issued is not None and issued + SUBSCRIBE_COOLDOWN > _now()
-
         if existing is None:
-            sub = db.Subscriber(station=body.station, phone=phone, mode=body.mode,
-                                threshold_c=body.threshold_c, verified=False,
-                                active=True)
-            code = _issue_code(sub)
+            sub = db.Subscriber(station=body.station, phone=phone,
+                                verified=False, active=False)
             session.add(sub)
-            session.commit()
-            _send_or_503(sender, phone, format_verification_sms(code))
-        elif existing.verified and existing.active:
-            # Verified + active: apply settings immediately (never disable warnings)
-            # and ANNOUNCE the change, so an unauthorised edit is self-reporting.
-            if _cooled_down(existing):
-                raise HTTPException(429, "please wait before changing settings again")
-            existing.mode = body.mode
-            existing.threshold_c = body.threshold_c
-            existing.verify_code_issued_at = _now()   # throttle the announce SMS too
-            session.commit()
-            summary = (f"{existing.mode}"
-                       + (f" below {existing.threshold_c:+.1f} C"
-                          if existing.mode == "frost" else ""))
-            _send_or_503(sender, phone,
-                         format_settings_changed_sms(config.station_label(existing.station), summary))
-            sub = existing
-        else:
-            # Unverified, OR previously unsubscribed (active=False): (re)enter the
-            # pending flow. Reactivation is NOT silent -- it requires a code, so an
-            # opted-out number cannot be switched back on by an unauthenticated POST.
-            if _cooled_down(existing):
-                raise HTTPException(429, "code recently sent; try again shortly")
-            existing.mode = body.mode
-            existing.threshold_c = body.threshold_c
-            existing.verified = False
-            code = _issue_code(existing)
-            session.commit()
-            _send_or_503(sender, phone, format_verification_sms(code))
-            sub = existing
-        return SubscribeOut(id=sub.id, station=sub.station, verified=sub.verified)
+            try:
+                session.flush()   # surface a concurrent-insert conflict now
+            except IntegrityError:
+                # Another request created the row first (A5): fall through to it.
+                session.rollback()
+                sub = (session.query(db.Subscriber)
+                       .filter_by(phone=phone, station=body.station).one())
+            existing = sub
 
-    @app.post("/api/verify", response_model=SubscribeOut)
+        # EVERY path (new, unverified, verified, opted-out) only STAGES settings +
+        # a code. Nothing that changes what the subscriber receives is applied here
+        # -- verification promotes it. This is the single rule that makes the auth
+        # safe (A1 + A2).
+        code = _stage_code(existing, body.mode, body.threshold_c)
+        session.commit()
+        summary = format_settings_summary(config.station_label(body.station),
+                                          body.mode, body.threshold_c)
+        _send_and_mark(session, existing, phone, format_verification_sms(code, summary))
+        return StatusOut()
+
+    @app.post("/api/verify", response_model=VerifyOut)
     def verify(body: VerifyIn, session=Depends(get_session)):
-        # Verify is the ONLY path that activates a subscription (initial or a
-        # reactivation after unsubscribe), and it always requires a fresh code --
-        # so an opted-out number can never be switched back on unauthenticated.
+        # Verify is the ONLY path that activates a subscription and the ONLY path
+        # that promotes staged settings into effect. It always requires a fresh
+        # code, so nothing a grower receives changes without one.
+        #
+        # DoS note (A6): the 5-attempt lock protects the code, but on its own it is
+        # lockout-DoS-able (an attacker burns the cap so the grower's real code
+        # 429s). The mitigation is a per-IP rate limit at the edge (reverse proxy /
+        # slowapi) plus a global daily send budget -- deployment-layer concerns, not
+        # wired here because the default sender is a no-cost log stub. The code path
+        # must not be shaped so that adding a real provider is the dangerous step.
         try:
             phone = normalize_e164(body.phone, region_for_station(body.station))
         except InvalidPhone as exc:
             raise HTTPException(422, f"invalid phone: {exc}")
         sub = (session.query(db.Subscriber)
                .filter_by(phone=phone, station=body.station).one_or_none())
-        # Return the SAME 400 whether the subscription is unknown or the code is
-        # wrong, so the endpoint cannot be used to enumerate who is subscribed.
+        # Same 400 whether unknown or wrong code, so verify cannot enumerate.
         bad = HTTPException(400, "invalid phone, station, or code")
         if sub is None or sub.verify_code_hash is None:
             raise bad
@@ -247,16 +258,21 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
         if not secrets.compare_digest(sub.verify_code_hash, _hash_code(body.code)):
             session.commit()
             raise bad
+        # Correct code -> activate AND promote the staged settings (falling back to
+        # the current values if nothing was staged).
         sub.verified = True
         sub.active = True
+        if sub.pending_mode is not None:
+            sub.mode = sub.pending_mode
+        if sub.pending_threshold_c is not None:
+            sub.threshold_c = sub.pending_threshold_c
+        sub.pending_mode = None
+        sub.pending_threshold_c = None
         sub.verify_code_hash = None
         sub.verify_expires_at = None
-        # Clear the issue timestamp: the code is consumed, so it must no longer
-        # count toward the cooldown a subsequent legitimate settings change checks.
-        sub.verify_code_issued_at = None
         sub.verified_at = _now()
         session.commit()
-        return SubscribeOut(id=sub.id, station=sub.station, verified=True)
+        return VerifyOut(verified=True)
 
     @app.post("/api/unsubscribe")
     def unsubscribe(body: UnsubscribeStartIn, session=Depends(get_session)):
@@ -278,13 +294,31 @@ def create_app(session_factory=None, sms_sender=None) -> FastAPI:
             raise HTTPException(422, f"invalid phone: {exc}")
         sub = (session.query(db.Subscriber)
                .filter_by(phone=phone, station=body.station).one_or_none())
-        if sub is not None and sub.active:
+        if sub is not None:
+            was_active = sub.active
             sub.active = False
-            sub.unsubscribed_at = _now()
+            # Invalidate any outstanding code (A7) on ANY opt-out, active or pending:
+            # a code issued before the opt-out must not reactivate after it. Also
+            # drop staged settings. Done regardless of prior active state, so opting
+            # out of a still-pending subscription cancels its code too.
+            sub.verify_code_hash = None
+            sub.verify_expires_at = None
+            sub.pending_mode = None
+            sub.pending_threshold_c = None
+            if was_active:
+                sub.unsubscribed_at = _now()
             session.commit()
-            _send_or_503(sender, phone,
-                         format_unsubscribe_sms(config.station_label(sub.station)))
-        return {"status": "unsubscribed if the subscription existed"}
+            # Confirm by SMS only if they were actually active (nothing to confirm
+            # for a pending row that never activated).
+            if was_active:
+                try:
+                    sender.send(phone,
+                                format_unsubscribe_sms(config.station_label(sub.station)))
+                    sub.last_sms_at = _now()
+                    session.commit()
+                except Exception:  # noqa: BLE001 -- deactivation durable; SMS best-effort
+                    pass
+        return StatusOut()
 
     @app.get("/api/forecasts/{station}", response_model=list[ForecastOut])
     def forecasts(station: str, limit: int = 7, session=Depends(get_session)):

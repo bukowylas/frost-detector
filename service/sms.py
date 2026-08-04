@@ -76,9 +76,20 @@ def format_no_forecast_sms(station_label: str, date_label: str) -> str:
             f"{STOP_LINE}")
 
 
-def format_verification_sms(code: str) -> str:
-    return (f"Your Frost Detector verification code is {code}.\n"
-            f"Enter it to activate nightly frost forecasts.")
+def format_settings_summary(station_label: str, mode: str, threshold_c: float) -> str:
+    """A one-line description of what a subscription will do, for the code SMS."""
+    if mode == "frost":
+        return f"{station_label}, frost alerts below {threshold_c:+.1f} C"
+    return f"{station_label}, a forecast every night"
+
+
+def format_verification_sms(code: str, settings_summary: str) -> str:
+    """The verification SMS. It NAMES the settings the code will confirm, so the
+    code round-trip authenticates *what the subscription does*, not merely the
+    number -- a request that tried to poison the settings is visible before the
+    grower types the code."""
+    return (f"Frost Detector code {code} -- confirms: {settings_summary}.\n"
+            f"Enter it to activate. Ignore this if you didn't request it.")
 
 
 def format_unsubscribe_sms(station_label: str) -> str:
@@ -87,10 +98,3 @@ def format_unsubscribe_sms(station_label: str) -> str:
     being told, and the grower resumes with one word."""
     return (f"You've been unsubscribed from {station_label} frost forecasts.\n"
             f"Reply START to resume.")
-
-
-def format_settings_changed_sms(station_label: str, summary: str) -> str:
-    """Sent when a verified subscriber's settings change. Makes an unauthorised
-    change self-reporting -- the grower is told, and can react."""
-    return (f"Your {station_label} frost alerts changed: {summary}.\n"
-            f"If this wasn't you, reply STOP.")

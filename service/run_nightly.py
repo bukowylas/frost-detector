@@ -61,14 +61,19 @@ def main() -> None:
         logging.info("notified %d subscriber(s); retried %d pending",
                      len(sent), len(resent))
 
-    # Health: surface failed sends and station skips, and exit non-zero when the
-    # night was not clean -- a cron that always exits 0 is a cron nobody watches.
+    # Health: a single expected skip is a warning (logged, exit 0); a station that
+    # never ran, a send failure, or a station skipping two nights running is an
+    # alert (exit non-zero). A cron that always exits 0 is a cron nobody watches;
+    # a cron that alerts on every expected skip is one whose exit code gets ignored.
     health = notify.notify_health(session, date)
+    if health["skips"]:
+        logging.warning("skips for %s: %s", date, health["skips"])
     if health["healthy"]:
         logging.info("health OK for %s: %s", date, health["send_status"])
     else:
-        logging.error("UNHEALTHY %s: status=%s skips=%s",
-                      date, health["send_status"], health["skips"])
+        logging.error("UNHEALTHY %s: missing=%s failed=%s repeated_skips=%s",
+                      date, health["missing"], health["send_status"].get("failed"),
+                      health["repeated_skips"])
         raise SystemExit(1)
 
 

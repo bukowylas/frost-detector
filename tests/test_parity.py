@@ -41,6 +41,7 @@ pass having checked nothing is not a gate.
 """
 
 import math
+import sys
 import time
 
 import pandas as pd
@@ -123,14 +124,40 @@ def _stratified_cases():
 
 
 CASES = _stratified_cases()
+_N_CASES = len(CASES)
+
+# The wall-clock time of the last OGIMET query, so pacing waits only the minimum
+# remaining out of the 20 s rate limit -- never a full fixed sleep, never after the
+# final case, and never on the non-network coverage test. `n` counts cases started,
+# for progress reporting (the run is mostly rate-limit waiting, so show it).
+_last_query = {"at": 0.0}
+_progress = {"n": 0}
 
 
-@pytest.fixture(autouse=True)
-def _pace_ogimet():
-    """Sleep AFTER every case (pass or fail) so a failing assertion never removes
-    the pacing and cascades the rest into rate-limit skips."""
-    yield
-    time.sleep(_OGIMET_COOLDOWN_S)
+def _log(msg):
+    """Progress to stderr, flushed, so a ~100 s rate-limited run is not a silent
+    black box. Visible with `-s`."""
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _paced_fetch(station, date, cutoff):
+    """Fetch, waiting only as long as OGIMET's 1-query-per-20-s limit requires
+    since the previous query. Pacing lives around the fetch itself, so a failing
+    assertion later in the test can never remove it. Reports progress at each step."""
+    _progress["n"] += 1
+    i = _progress["n"]
+    wait = _OGIMET_COOLDOWN_S - (time.monotonic() - _last_query["at"])
+    if wait > 0:
+        _log(f"[{i}/{_N_CASES}] {station} {date}: waiting {wait:.0f}s (OGIMET rate limit)...")
+        time.sleep(wait)
+    _log(f"[{i}/{_N_CASES}] {station} {date}: fetching...")
+    t0 = time.monotonic()
+    try:
+        obs = live.fetch_window(station, cutoff)
+    finally:
+        _last_query["at"] = time.monotonic()
+    _log(f"[{i}/{_N_CASES}] {station} {date}: fetched in {time.monotonic()-t0:.1f}s, {len(obs)} obs")
+    return obs
 
 
 @pytest.mark.parametrize("station,date", CASES)
@@ -143,7 +170,7 @@ def test_live_matches_training(station, date):
     cutoff = pd.Timestamp(date) + pd.Timedelta(hours=prepare.CUTOFF_HOUR)
 
     try:
-        obs = live.fetch_window(station, cutoff)
+        obs = _paced_fetch(station, date, cutoff)
     except live.OgimetError as exc:
         pytest.skip(f"provider declined (rate-limit/error body): {exc}")
     except Exception as exc:  # noqa: BLE001 -- network unreachable: skip, not fail
@@ -196,10 +223,11 @@ def test_live_matches_training(station, date):
 
     # The quantified cloud limitation: what running cloud-blank costs on this
     # night (informational, not an assertion) -- reported, never hidden.
-    print(f"  {station} {date}: forecast {live_pred:.2f} C; "
-          f"running cloud-blank costs {abs(blank_pred - full_pred):.3f} C here")
     _executed["count"] += 1
     _executed["stations"].add(station)
+    _log(f"[{_progress['n']}/{_N_CASES}] {station} {date}: VALIDATED -- "
+         f"forecast {live_pred:.2f} C; cloud-blank costs "
+         f"{abs(blank_pred - full_pred):.3f} C")
 
 
 def test_parity_coverage():
@@ -212,6 +240,8 @@ def test_parity_coverage():
         pytest.skip("no cases (nights.csv missing)")
     expected = set(config.SERVICEABLE_STATIONS)
     missing = expected - _executed["stations"]
+    _log(f"coverage: {_executed['count']}/{_N_CASES} cases validated across "
+         f"{len(_executed['stations'])}/{len(expected)} serviceable stations")
     assert not missing, (
         f"parity did not validate every serviceable station -- missing {missing} "
         f"(provider rate-limited/unreachable?). A gate that skips a served station "

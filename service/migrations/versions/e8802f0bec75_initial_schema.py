@@ -1,14 +1,14 @@
 """initial schema
 
-Revision ID: 6745412cdfc3
+Revision ID: e8802f0bec75
 Revises: 
-Create Date: 2026-08-04 12:25:00.192627
+Create Date: 2026-08-04 15:57:02.075014
 """
 from alembic import op
 import sqlalchemy as sa
 
 
-revision = '6745412cdfc3'
+revision = 'e8802f0bec75'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -55,12 +55,16 @@ def upgrade() -> None:
     sa.Column('phone', sa.String(length=32), nullable=False),
     sa.Column('mode', sa.String(length=16), nullable=False),
     sa.Column('threshold_c', sa.Float(), nullable=False),
+    sa.Column('pending_mode', sa.String(length=16), nullable=True),
+    sa.Column('pending_threshold_c', sa.Float(), nullable=True),
     sa.Column('verified', sa.Boolean(), nullable=False),
     sa.Column('verify_code_hash', sa.String(length=64), nullable=True),
     sa.Column('verify_attempts', sa.Integer(), nullable=False),
-    sa.Column('verify_code_issued_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('verify_expires_at', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('active', sa.Boolean(), server_default=sa.text('1'), nullable=False),
+    sa.Column('last_sms_at', sa.DateTime(timezone=True), nullable=True),
+    # sa.true() compiles to `true` on Postgres and `1` on SQLite; a bare text('1')
+    # is rejected as an integer default on a Postgres boolean column.
+    sa.Column('active', sa.Boolean(), server_default=sa.true(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('verified_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('unsubscribed_at', sa.DateTime(timezone=True), nullable=True),
@@ -80,7 +84,7 @@ def upgrade() -> None:
     sa.Column('last_error', sa.String(length=256), nullable=True),
     sa.Column('claimed_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('sent_at', sa.DateTime(timezone=True), nullable=True),
-    sa.ForeignKeyConstraint(['subscriber_id'], ['subscribers.id'], ),
+    sa.ForeignKeyConstraint(['subscriber_id'], ['subscribers.id'], ondelete='RESTRICT'),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('subscriber_id', 'forecast_date', name='uq_sent_sub_date')
     )
